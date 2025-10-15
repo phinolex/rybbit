@@ -114,14 +114,17 @@ export async function getSessions(req: FastifyRequest<GetSessionsRequest>, res: 
   `;
 
   try {
+    const effectiveLimit = limit || 100;
+    const effectivePage = page || 1;
+
     const result = await clickhouse.query({
       query,
       format: "JSONEachRow",
       query_params: {
         siteId: Number(site),
         userId,
-        limit: limit || 100,
-        offset: (page - 1) * (limit || 100),
+        limit: effectiveLimit,
+        offset: (effectivePage - 1) * effectiveLimit,
       },
     });
 

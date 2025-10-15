@@ -1,0 +1,3377 @@
+diff --git a/server/src/api/v1/events.schema.test.ts b/server/src/api/v1/events.schema.test.ts
+new file mode 100644
+index 0000000..2bc891c
+--- /dev/null
++++ b/server/src/api/v1/events.schema.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, it } from "vitest";
++import { eventSchema, payloadSchema } from "./events.js";
++
++describe("eventSchema validation", () => {
++  const baseEvent = {
++    timestamp: "2024-12-01T10:00:00.000Z",
++    page_url: "https://example.com/page",
++    path: "/page",
++    session_id: "sess_123",
++  };
++
++  it("accepts a minimal valid event", () => {
++    const parsed = eventSchema.parse(baseEvent);
++    expect(parsed).toMatchObject({ session_id: "sess_123" });
++  });
++
++  it("accepts when anon_id is provided instead of session_id", () => {
++    const parsed = eventSchema.parse({
++      ...baseEvent,
++      session_id: undefined,
++      anon_id: "anon_1",
++    });
++    expect(parsed.anon_id).toBe("anon_1");
++  });
++
++  it("rejects when no identifier is provided", () => {
++    expect(() =>
++      eventSchema.parse({
++        ...baseEvent,
++        session_id: undefined,
++      })
++    ).toThrowError(/One of session_id, anon_id or user_id must be provided/);
++  });
++
++  it("rejects invalid timestamp", () => {
++    expect(() =>
++      eventSchema.parse({
++        ...baseEvent,
++        timestamp: "invalid-date",
++      })
++    ).toThrow();
++  });
++});
++
++describe("payloadSchema batching", () => {
++  const baseEvent = {
++    timestamp: "2024-12-01T10:00:00.000Z",
++    session_id: "sess_123",
++  };
++
++  it("accepts a single event object", () => {
++    expect(() => payloadSchema.parse(baseEvent)).not.toThrow();
++  });
++
++  it("accepts an array of events", () => {
++    const batch = Array.from({ length: 3 }, (_, index) => ({
++      ...baseEvent,
++      session_id: `sess_${index}`,
++    }));
++    expect(() => payloadSchema.parse(batch)).not.toThrow();
++  });
++
++  it("rejects empty arrays", () => {
++    expect(() => payloadSchema.parse([])).toThrow();
++  });
++});
+diff --git a/server/src/api/v1/funnels.ts b/server/src/api/v1/funnels.ts
+new file mode 100644
+index 0000000..c560c0f
+--- /dev/null
++++ b/server/src/api/v1/funnels.ts
+@@ -0,0 +1,176 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import type { FunnelRecord } from "../../services/projects/funnelService.js";
++import {
++  createFunnel,
++  deleteFunnel,
++  FunnelInput,
++  getFunnel,
++  getFunnelStats,
++  listFunnels,
++  updateFunnel,
++} from "../../services/projects/funnelService.js";
++
++const stepSchema = z.object({
++  key: z.string().min(1).max(64),
++  name: z.string().min(1).max(128),
++  order: z.number().int().nonnegative().optional(),
++  page_pattern: z.string().max(2048).optional(),
++});
++
++const funnelSchema = z.object({
++  name: z.string().min(1).max(128),
++  description: z.string().max(512).optional(),
++  is_active: z.boolean().optional(),
++  steps: z.array(stepSchema).min(1),
++});
++
++const updateSchema = funnelSchema.partial().extend({
++  steps: z.array(stepSchema).min(1).optional(),
++});
++
++const statsQuerySchema = z.object({
++  from: z.string().datetime().optional(),
++  to: z.string().datetime().optional(),
++});
++
++type IdParams = {
++  id: string;
++};
++
++function mapFunnel(funnel: FunnelRecord) {
++  return {
++    id: funnel.id,
++    name: funnel.name,
++    description: funnel.description,
++    is_active: funnel.isActive,
++    created_at: funnel.createdAt,
++    updated_at: funnel.updatedAt,
++    steps: funnel.steps.map(step => ({
++      id: step.id,
++      key: step.key,
++      name: step.name,
++      order: step.order,
++      page_pattern: step.pagePattern,
++    })),
++  };
++}
++
++function mapFunnelResponse(funnel: FunnelRecord | null) {
++  return funnel ? mapFunnel(funnel) : null;
++}
++
++export async function registerFunnelRoutes(server: FastifyInstance) {
++  server.post("/", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const parsed = funnelSchema.safeParse(request.body);
++    if (!parsed.success) {
++      return reply.status(400).send({ error: "Invalid payload", details: parsed.error.issues });
++    }
++
++    const input: FunnelInput = {
++      name: parsed.data.name,
++      description: parsed.data.description,
++      isActive: parsed.data.is_active,
++      steps: parsed.data.steps.map(step => ({
++        key: step.key,
++        name: step.name,
++        order: step.order,
++        pagePattern: step.page_pattern,
++      })),
++    };
++
++    try {
++      const funnel = await createFunnel(request.project.id, input);
++      return reply.status(201).send({ data: mapFunnelResponse(funnel) });
++    } catch (error) {
++      request.log.error(error, "Failed to create funnel");
++      return reply.status(500).send({ error: "Failed to create funnel" });
++    }
++  });
++
++  server.get("/", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++    const funnels = await listFunnels(request.project.id);
++    return reply.send({
++      data: funnels.map(mapFunnel),
++    });
++  });
++
++  server.get<{ Params: IdParams }>("/:id", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const funnel = await getFunnel(request.project.id, request.params.id);
++    if (!funnel) {
++      return reply.status(404).send({ error: "Funnel not found" });
++    }
++    return reply.send({ data: mapFunnelResponse(funnel) });
++  });
++
++  server.patch<{ Params: IdParams }>("/:id", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const parsed = updateSchema.safeParse(request.body);
++    if (!parsed.success) {
++      return reply.status(400).send({ error: "Invalid payload", details: parsed.error.issues });
++    }
++
++    const input: Partial<FunnelInput> = {};
++    if (parsed.data.name !== undefined) input.name = parsed.data.name;
++    if (parsed.data.description !== undefined) input.description = parsed.data.description;
++    if (parsed.data.is_active !== undefined) input.isActive = parsed.data.is_active;
++    if (parsed.data.steps) {
++      input.steps = parsed.data.steps.map(step => ({
++        key: step.key,
++        name: step.name,
++        order: step.order,
++        pagePattern: step.page_pattern,
++      }));
++    }
++
++    const funnel = await updateFunnel(request.project.id, request.params.id, input);
++    if (!funnel) {
++      return reply.status(404).send({ error: "Funnel not found" });
++    }
++    return reply.send({ data: mapFunnelResponse(funnel) });
++  });
++
++  server.delete<{ Params: IdParams }>("/:id", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const success = await deleteFunnel(request.project.id, request.params.id);
++    if (!success) {
++      return reply.status(404).send({ error: "Funnel not found" });
++    }
++    return reply.status(204).send();
++  });
++
++  server.get<{ Params: IdParams }>("/:id/stats", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const parsedQuery = statsQuerySchema.safeParse(request.query);
++    if (!parsedQuery.success) {
++      return reply.status(400).send({ error: "Invalid query parameters", details: parsedQuery.error.issues });
++    }
++
++    const stats = await getFunnelStats(request.project.id, request.params.id, parsedQuery.data);
++    if (!stats) {
++      return reply.status(404).send({ error: "Funnel not found" });
++    }
++
++    return reply.send({ data: stats });
++  });
++}
+diff --git a/server/src/api/v1/middleware.ts b/server/src/api/v1/middleware.ts
+new file mode 100644
+index 0000000..6913906
+--- /dev/null
++++ b/server/src/api/v1/middleware.ts
+@@ -0,0 +1,33 @@
++import { FastifyReply, FastifyRequest } from "fastify";
++import { projectRateLimiter } from "../../lib/projectRateLimiter.js";
++import { createServiceLogger } from "../../lib/logger/logger.js";
++import { getProjectByApiKey } from "../../services/projects/projectService.js";
++
++const logger = createServiceLogger("api-v1");
++
++export async function authenticateProject(request: FastifyRequest, reply: FastifyReply) {
++  const apiKey = request.headers["x-api-key"];
++
++  if (!apiKey || typeof apiKey !== "string") {
++    logger.warn({ path: request.url }, "Missing API key");
++    return reply.status(401).send({ error: "Missing API key" });
++  }
++
++  const project = await getProjectByApiKey(apiKey);
++  if (!project) {
++    logger.warn({ path: request.url }, "Invalid API key");
++    return reply.status(401).send({ error: "Invalid API key" });
++  }
++
++  if (!projectRateLimiter.isAllowed(project.id)) {
++    const resetTime = projectRateLimiter.getResetTime(project.id);
++    if (resetTime) {
++      reply.header("Retry-After", Math.ceil((resetTime - Date.now()) / 1000));
++    }
++    logger.warn({ projectId: project.id, path: request.url }, "Rate limit exceeded");
++    return reply.status(429).send({ error: "Rate limit exceeded" });
++  }
++
++  request.project = project;
++  request.log.info({ projectId: project.id, path: request.url }, "Authenticated project request");
++}
+diff --git a/server/src/api/v1/realtime.ts b/server/src/api/v1/realtime.ts
+new file mode 100644
+index 0000000..988a129
+--- /dev/null
++++ b/server/src/api/v1/realtime.ts
+@@ -0,0 +1,31 @@
++import { FastifyInstance } from "fastify";
++import { getRealtimeStats } from "../../services/projects/statsService.js";
++
++export async function registerRealtimeRoutes(server: FastifyInstance) {
++  server.get("/visitors", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    reply.header("Content-Type", "text/event-stream");
++    reply.header("Cache-Control", "no-cache");
++    reply.header("Connection", "keep-alive");
++
++    const stream = reply.raw;
++
++    const sendUpdate = async () => {
++      const data = await getRealtimeStats(request.project!.id);
++      stream.write(`event: update\n`);
++      stream.write(`data: ${JSON.stringify(data)}\n\n`);
++    };
++
++    const interval = setInterval(sendUpdate, 5000);
++    await sendUpdate();
++
++    request.raw.on("close", () => {
++      clearInterval(interval);
++    });
++
++    return reply;
++  });
++}
+diff --git a/server/src/api/v1/stats.ts b/server/src/api/v1/stats.ts
+new file mode 100644
+index 0000000..85d47d5
+--- /dev/null
++++ b/server/src/api/v1/stats.ts
+@@ -0,0 +1,66 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { getOverviewStats, getPageStats, getRealtimeStats } from "../../services/projects/statsService.js";
++
++const overviewQuerySchema = z.object({
++  granularity: z.enum(["daily", "monthly", "yearly"]).default("daily"),
++  from: z.string().datetime().optional(),
++  to: z.string().datetime().optional(),
++});
++
++const pagesQuerySchema = z.object({
++  path: z.string().max(2048).optional(),
++  page_url: z.string().max(2048).optional(),
++  from: z.string().datetime().optional(),
++  to: z.string().datetime().optional(),
++});
++
++export async function registerStatsRoutes(server: FastifyInstance) {
++  server.get("/overview", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const parsed = overviewQuerySchema.safeParse(request.query);
++    if (!parsed.success) {
++      return reply.status(400).send({ error: "Invalid query parameters", details: parsed.error.issues });
++    }
++
++    const data = await getOverviewStats(request.project.id, {
++      granularity: parsed.data.granularity,
++      from: parsed.data.from,
++      to: parsed.data.to,
++    });
++
++    return reply.send({ data });
++  });
++
++  server.get("/pages", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const parsed = pagesQuerySchema.safeParse(request.query);
++    if (!parsed.success) {
++      return reply.status(400).send({ error: "Invalid query parameters", details: parsed.error.issues });
++    }
++
++    const data = await getPageStats(request.project.id, {
++      path: parsed.data.path,
++      pageUrl: parsed.data.page_url,
++      from: parsed.data.from,
++      to: parsed.data.to,
++    });
++
++    return reply.send({ data });
++  });
++
++  server.get("/realtime", async (request, reply) => {
++    if (!request.project) {
++      return reply.status(500).send({ error: "Project context missing" });
++    }
++
++    const data = await getRealtimeStats(request.project.id);
++    return reply.send({ data });
++  });
++}
+diff --git a/server/src/db/postgres/schema.ts b/server/src/db/postgres/schema.ts
+index c44befe..626251b 100644
+--- a/server/src/db/postgres/schema.ts
++++ b/server/src/db/postgres/schema.ts
+@@ -1,10 +1,11 @@
+-import { sql } from "drizzle-orm";
++import { sql } from "drizzle-orm";
+ import {
+   boolean,
+   check,
+   foreignKey,
+   index,
+   integer,
++  date,
+   jsonb,
+   pgTable,
+   real,
+@@ -13,586 +14,773 @@ import {
+   timestamp,
+   unique,
+ } from "drizzle-orm/pg-core";
+-
+-// User table
+-export const user = pgTable(
+-  "user",
+-  {
+-    id: text().primaryKey().notNull(),
+-    name: text().notNull(),
+-    username: text(),
+-    email: text().notNull(),
+-    emailVerified: boolean().notNull(),
+-    image: text(),
+-    createdAt: timestamp({ mode: "string" }).notNull(),
+-    updatedAt: timestamp({ mode: "string" }).notNull(),
+-    role: text().default("user").notNull(),
+-    displayUsername: text(),
+-    banned: boolean(),
+-    banReason: text(),
+-    banExpires: timestamp({ mode: "string" }),
+-    // deprecated
+-    stripeCustomerId: text(),
+-    // deprecated
+-    overMonthlyLimit: boolean().default(false),
+-    // deprecated
+-    monthlyEventCount: integer().default(0),
+-    sendAutoEmailReports: boolean().default(true),
+-  },
+-  table => [unique("user_username_unique").on(table.username), unique("user_email_unique").on(table.email)]
+-);
+-
+-export const verification = pgTable("verification", {
+-  id: text().primaryKey().notNull(),
+-  identifier: text().notNull(),
+-  value: text().notNull(),
+-  expiresAt: timestamp({ mode: "string" }).notNull(),
+-  createdAt: timestamp({ mode: "string" }),
+-  updatedAt: timestamp({ mode: "string" }),
+-});
+-
+-// Sites table
+-export const sites = pgTable(
+-  "sites",
+-  {
+-    id: text("id").$defaultFn(() => sql`encode(gen_random_bytes(6), 'hex')`),
+-    // deprecated - keeping as primary key for backwards compatibility
+-    siteId: serial("site_id").primaryKey().notNull(),
+-    name: text("name").notNull(),
+-    domain: text("domain").notNull(),
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+-    createdBy: text("created_by")
+-      .notNull()
+-      .references(() => user.id),
+-    organizationId: text("organization_id").references(() => organization.id),
+-    public: boolean().default(false),
+-    saltUserIds: boolean().default(false),
+-    blockBots: boolean().default(true).notNull(),
+-    excludedIPs: jsonb("excluded_ips").default([]), // Array of IP addresses/ranges to exclude
+-    sessionReplay: boolean().default(false),
+-    webVitals: boolean().default(false),
+-    trackErrors: boolean().default(false),
+-    trackOutbound: boolean().default(true),
+-    trackUrlParams: boolean().default(true),
+-    trackInitialPageView: boolean().default(true),
+-    trackSpaNavigation: boolean().default(true),
+-    trackIp: boolean().default(false),
+-    apiKey: text("api_key"), // Format: rb_{32_hex_chars} = 35 chars total
+-  },
+-  table => [
+-    foreignKey({
+-      columns: [table.createdBy],
+-      foreignColumns: [user.id],
+-      name: "sites_created_by_user_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "sites_organization_id_organization_id_fk",
+-    }),
+-  ]
+-);
+-
+-// Active sessions table
+-export const activeSessions = pgTable("active_sessions", {
+-  sessionId: text("session_id").primaryKey().notNull(),
+-  siteId: integer("site_id"),
+-  userId: text("user_id"),
+-  startTime: timestamp("start_time").defaultNow(),
+-  lastActivity: timestamp("last_activity").defaultNow(),
+-});
+-
+-export const funnels = pgTable(
+-  "funnels",
+-  {
+-    reportId: serial("report_id").primaryKey().notNull(),
+-    siteId: integer("site_id"),
+-    userId: text("user_id"),
+-    data: jsonb(),
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+-  },
+-  table => [
+-    foreignKey({
+-      columns: [table.siteId],
+-      foreignColumns: [sites.siteId],
+-      name: "funnels_site_id_sites_site_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.userId],
+-      foreignColumns: [user.id],
+-      name: "funnels_user_id_user_id_fk",
+-    }),
+-  ]
+-);
+-
+-export const account = pgTable(
+-  "account",
+-  {
+-    id: text().primaryKey().notNull(),
+-    accountId: text().notNull(),
+-    providerId: text().notNull(),
+-    userId: text().notNull(),
+-    accessToken: text(),
+-    refreshToken: text(),
+-    idToken: text(),
+-    accessTokenExpiresAt: timestamp({ mode: "string" }),
+-    refreshTokenExpiresAt: timestamp({ mode: "string" }),
+-    scope: text(),
+-    password: text(),
+-    createdAt: timestamp({ mode: "string" }).notNull(),
+-    updatedAt: timestamp({ mode: "string" }).notNull(),
+-  },
+-  table => [
+-    foreignKey({
+-      columns: [table.userId],
+-      foreignColumns: [user.id],
+-      name: "account_userId_user_id_fk",
+-    }),
+-  ]
+-);
+-
+-export const organization = pgTable(
+-  "organization",
+-  {
+-    id: text().primaryKey().notNull(),
+-    name: text().notNull(),
+-    slug: text().notNull(),
+-    logo: text(),
+-    createdAt: timestamp({ mode: "string" }).notNull(),
+-    metadata: text(),
+-    stripeCustomerId: text(),
+-    monthlyEventCount: integer().default(0),
+-    overMonthlyLimit: boolean().default(false),
+-  },
+-  table => [unique("organization_slug_unique").on(table.slug)]
+-);
+-
+-export const member = pgTable(
+-  "member",
+-  {
+-    id: text().primaryKey().notNull(),
+-    organizationId: text().notNull(),
+-    userId: text().notNull(),
+-    role: text().notNull(),
+-    createdAt: timestamp({ mode: "string" }).notNull(),
+-  },
+-  table => [
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "member_organizationId_organization_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.userId],
+-      foreignColumns: [user.id],
+-      name: "member_userId_user_id_fk",
+-    }),
+-  ]
+-);
+-
+-export const invitation = pgTable(
+-  "invitation",
++
++// User table
++export const user = pgTable(
++  "user",
++  {
++    id: text().primaryKey().notNull(),
++    name: text().notNull(),
++    username: text(),
++    email: text().notNull(),
++    emailVerified: boolean().notNull(),
++    image: text(),
++    createdAt: timestamp({ mode: "string" }).notNull(),
++    updatedAt: timestamp({ mode: "string" }).notNull(),
++    role: text().default("user").notNull(),
++    displayUsername: text(),
++    banned: boolean(),
++    banReason: text(),
++    banExpires: timestamp({ mode: "string" }),
++    // deprecated
++    stripeCustomerId: text(),
++    // deprecated
++    overMonthlyLimit: boolean().default(false),
++    // deprecated
++    monthlyEventCount: integer().default(0),
++    sendAutoEmailReports: boolean().default(true),
++  },
++  table => [unique("user_username_unique").on(table.username), unique("user_email_unique").on(table.email)]
++);
++
++export const verification = pgTable("verification", {
++  id: text().primaryKey().notNull(),
++  identifier: text().notNull(),
++  value: text().notNull(),
++  expiresAt: timestamp({ mode: "string" }).notNull(),
++  createdAt: timestamp({ mode: "string" }),
++  updatedAt: timestamp({ mode: "string" }),
++});
++
++// Sites table
++export const sites = pgTable(
++  "sites",
++  {
++    id: text("id").$defaultFn(() => sql`encode(gen_random_bytes(6), 'hex')`),
++    // deprecated - keeping as primary key for backwards compatibility
++    siteId: serial("site_id").primaryKey().notNull(),
++    name: text("name").notNull(),
++    domain: text("domain").notNull(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++    createdBy: text("created_by")
++      .notNull()
++      .references(() => user.id),
++    organizationId: text("organization_id").references(() => organization.id),
++    public: boolean().default(false),
++    saltUserIds: boolean().default(false),
++    blockBots: boolean().default(true).notNull(),
++    excludedIPs: jsonb("excluded_ips").default([]), // Array of IP addresses/ranges to exclude
++    sessionReplay: boolean().default(false),
++    webVitals: boolean().default(false),
++    trackErrors: boolean().default(false),
++    trackOutbound: boolean().default(true),
++    trackUrlParams: boolean().default(true),
++    trackInitialPageView: boolean().default(true),
++    trackSpaNavigation: boolean().default(true),
++    trackIp: boolean().default(false),
++    apiKey: text("api_key"), // Format: rb_{32_hex_chars} = 35 chars total
++  },
++  table => [
++    foreignKey({
++      columns: [table.createdBy],
++      foreignColumns: [user.id],
++      name: "sites_created_by_user_id_fk",
++    }),
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "sites_organization_id_organization_id_fk",
++    }),
++  ]
++);
++
++// Active sessions table
++export const activeSessions = pgTable("active_sessions", {
++  sessionId: text("session_id").primaryKey().notNull(),
++  siteId: integer("site_id"),
++  userId: text("user_id"),
++  startTime: timestamp("start_time").defaultNow(),
++  lastActivity: timestamp("last_activity").defaultNow(),
++});
++
++export const funnels = pgTable(
++  "funnels",
++  {
++    reportId: serial("report_id").primaryKey().notNull(),
++    siteId: integer("site_id"),
++    userId: text("user_id"),
++    data: jsonb(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.siteId],
++      foreignColumns: [sites.siteId],
++      name: "funnels_site_id_sites_site_id_fk",
++    }),
++    foreignKey({
++      columns: [table.userId],
++      foreignColumns: [user.id],
++      name: "funnels_user_id_user_id_fk",
++    }),
++  ]
++);
++
++export const account = pgTable(
++  "account",
++  {
++    id: text().primaryKey().notNull(),
++    accountId: text().notNull(),
++    providerId: text().notNull(),
++    userId: text().notNull(),
++    accessToken: text(),
++    refreshToken: text(),
++    idToken: text(),
++    accessTokenExpiresAt: timestamp({ mode: "string" }),
++    refreshTokenExpiresAt: timestamp({ mode: "string" }),
++    scope: text(),
++    password: text(),
++    createdAt: timestamp({ mode: "string" }).notNull(),
++    updatedAt: timestamp({ mode: "string" }).notNull(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.userId],
++      foreignColumns: [user.id],
++      name: "account_userId_user_id_fk",
++    }),
++  ]
++);
++
++export const organization = pgTable(
++  "organization",
++  {
++    id: text().primaryKey().notNull(),
++    name: text().notNull(),
++    slug: text().notNull(),
++    logo: text(),
++    createdAt: timestamp({ mode: "string" }).notNull(),
++    metadata: text(),
++    stripeCustomerId: text(),
++    monthlyEventCount: integer().default(0),
++    overMonthlyLimit: boolean().default(false),
++  },
++  table => [unique("organization_slug_unique").on(table.slug)]
++);
++
++export const member = pgTable(
++  "member",
++  {
++    id: text().primaryKey().notNull(),
++    organizationId: text().notNull(),
++    userId: text().notNull(),
++    role: text().notNull(),
++    createdAt: timestamp({ mode: "string" }).notNull(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "member_organizationId_organization_id_fk",
++    }),
++    foreignKey({
++      columns: [table.userId],
++      foreignColumns: [user.id],
++      name: "member_userId_user_id_fk",
++    }),
++  ]
++);
++
++export const invitation = pgTable(
++  "invitation",
++  {
++    id: text().primaryKey().notNull(),
++    email: text().notNull(),
++    inviterId: text().notNull(),
++    organizationId: text().notNull(),
++    role: text().notNull(),
++    status: text().notNull(),
++    expiresAt: timestamp({ mode: "string" }).notNull(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.inviterId],
++      foreignColumns: [user.id],
++      name: "invitation_inviterId_user_id_fk",
++    }),
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "invitation_organizationId_organization_id_fk",
++    }),
++  ]
++);
++
++export const session = pgTable(
++  "session",
++  {
++    id: text().primaryKey().notNull(),
++    expiresAt: timestamp({ mode: "string" }).notNull(),
++    token: text().notNull(),
++    createdAt: timestamp({ mode: "string" }).notNull(),
++    updatedAt: timestamp({ mode: "string" }).notNull(),
++    ipAddress: text(),
++    userAgent: text(),
++    userId: text().notNull(),
++    impersonatedBy: text(),
++    activeOrganizationId: text(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.userId],
++      foreignColumns: [user.id],
++      name: "session_userId_user_id_fk",
++    }),
++    unique("session_token_unique").on(table.token),
++  ]
++);
++
++// Goals table for tracking conversion goals
++export const goals = pgTable(
++  "goals",
+   {
+-    id: text().primaryKey().notNull(),
+-    email: text().notNull(),
+-    inviterId: text().notNull(),
+-    organizationId: text().notNull(),
+-    role: text().notNull(),
+-    status: text().notNull(),
+-    expiresAt: timestamp({ mode: "string" }).notNull(),
+-  },
+-  table => [
+-    foreignKey({
+-      columns: [table.inviterId],
+-      foreignColumns: [user.id],
+-      name: "invitation_inviterId_user_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "invitation_organizationId_organization_id_fk",
+-    }),
++    goalId: serial("goal_id").primaryKey().notNull(),
++    siteId: integer("site_id").notNull(),
++    name: text("name"), // Optional, user-defined name for the goal
++    goalType: text("goal_type").notNull(), // 'path' or 'event'
++    // Configuration specific to the goal type
++    config: jsonb("config").notNull().$type<{
++      // For 'path' type
++      pathPattern?: string; // e.g., "/pricing", "/product/*/view", "/docs/**"
++      // For 'event' type
++      eventName?: string; // e.g., "signup_completed", "file_downloaded"
++      eventPropertyKey?: string; // Optional property key to match
++      eventPropertyValue?: string | number | boolean; // Optional property value to match (exact match)
++    }>(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.siteId],
++      foreignColumns: [sites.siteId],
++      name: "goals_site_id_sites_site_id_fk",
++    }),
+   ]
+ );
+ 
+-export const session = pgTable(
+-  "session",
++export const projects = pgTable(
++  "projects",
+   {
+-    id: text().primaryKey().notNull(),
+-    expiresAt: timestamp({ mode: "string" }).notNull(),
+-    token: text().notNull(),
+-    createdAt: timestamp({ mode: "string" }).notNull(),
+-    updatedAt: timestamp({ mode: "string" }).notNull(),
+-    ipAddress: text(),
+-    userAgent: text(),
+-    userId: text().notNull(),
+-    impersonatedBy: text(),
+-    activeOrganizationId: text(),
++    id: text("id")
++      .$defaultFn(() => sql`encode(gen_random_bytes(8), 'hex')`)
++      .primaryKey()
++      .notNull(),
++    organizationId: text("organization_id")
++      .notNull()
++      .references(() => organization.id),
++    name: text("name").notNull(),
++    apiKeyHash: text("api_key_hash").notNull(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
++    metadata: jsonb("metadata").$type<Record<string, unknown>>().default(sql`'{}'::jsonb`),
++    isActive: boolean("is_active").default(true).notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.userId],
+-      foreignColumns: [user.id],
+-      name: "session_userId_user_id_fk",
+-    }),
+-    unique("session_token_unique").on(table.token),
++    index("projects_org_idx").on(table.organizationId),
++    unique("projects_api_key_hash_unique").on(table.apiKeyHash),
+   ]
+ );
+ 
+-// Goals table for tracking conversion goals
+-export const goals = pgTable(
+-  "goals",
++export const projectFunnels = pgTable(
++  "project_funnels",
+   {
+-    goalId: serial("goal_id").primaryKey().notNull(),
+-    siteId: integer("site_id").notNull(),
+-    name: text("name"), // Optional, user-defined name for the goal
+-    goalType: text("goal_type").notNull(), // 'path' or 'event'
+-    // Configuration specific to the goal type
+-    config: jsonb("config").notNull().$type<{
+-      // For 'path' type
+-      pathPattern?: string; // e.g., "/pricing", "/product/*/view", "/docs/**"
+-      // For 'event' type
+-      eventName?: string; // e.g., "signup_completed", "file_downloaded"
+-      eventPropertyKey?: string; // Optional property key to match
+-      eventPropertyValue?: string | number | boolean; // Optional property value to match (exact match)
+-    }>(),
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    id: text("id")
++      .$defaultFn(() => sql`encode(gen_random_bytes(8), 'hex')`)
++      .primaryKey()
++      .notNull(),
++    projectId: text("project_id")
++      .notNull()
++      .references(() => projects.id, { onDelete: "cascade" }),
++    name: text("name").notNull(),
++    description: text("description"),
++    isActive: boolean("is_active").default(true).notNull(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+   },
+-  table => [
+-    foreignKey({
+-      columns: [table.siteId],
+-      foreignColumns: [sites.siteId],
+-      name: "goals_site_id_sites_site_id_fk",
+-    }),
+-  ]
++  table => [index("project_funnels_project_idx").on(table.projectId)]
+ );
+ 
+-// Telemetry table for tracking self-hosted instances
+-export const telemetry = pgTable("telemetry", {
+-  id: serial("id").primaryKey().notNull(),
+-  instanceId: text("instance_id").notNull(),
+-  timestamp: timestamp("timestamp", { mode: "string" }).notNull().defaultNow(),
+-  version: text("version").notNull(),
+-  tableCounts: jsonb("table_counts").notNull().$type<Record<string, number>>(),
+-  clickhouseSizeGb: real("clickhouse_size_gb").notNull(),
+-});
+-
+-// Uptime monitor definitions
+-export const uptimeMonitors = pgTable(
+-  "uptime_monitors",
++export const projectFunnelSteps = pgTable(
++  "project_funnel_steps",
+   {
+-    id: serial("id").primaryKey().notNull(),
+-    organizationId: text("organization_id")
+-      .notNull()
+-      .references(() => organization.id),
+-    name: text("name"),
+-    monitorType: text("monitor_type").notNull(), // 'http', 'tcp'
+-
+-    // Common settings
+-    intervalSeconds: integer("interval_seconds").notNull(),
+-    enabled: boolean("enabled").default(true),
+-
+-    // HTTP/HTTPS specific configuration
+-    httpConfig: jsonb("http_config").$type<{
+-      url: string;
+-      method: "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH";
+-      headers?: Record<string, string>;
+-      body?: string;
+-      auth?: {
+-        type: "none" | "basic" | "bearer" | "api_key" | "custom_header";
+-        credentials?: {
+-          username?: string;
+-          password?: string;
+-          token?: string;
+-          headerName?: string;
+-          headerValue?: string;
+-        };
+-      };
+-      followRedirects?: boolean;
+-      timeoutMs?: number;
+-      ipVersion?: "any" | "ipv4" | "ipv6";
+-      userAgent?: string;
+-    }>(),
+-
+-    // TCP specific configuration
+-    tcpConfig: jsonb("tcp_config").$type<{
+-      host: string;
+-      port: number;
+-      timeoutMs?: number;
+-    }>(),
+-
+-    // Validation rules
+-    validationRules: jsonb("validation_rules").notNull().default([]).$type<
+-      Array<
+-        | {
+-            type: "status_code";
+-            operator: "equals" | "not_equals" | "in" | "not_in";
+-            value: number | number[];
+-          }
+-        | {
+-            type: "response_time";
+-            operator: "less_than" | "greater_than";
+-            value: number;
+-          }
+-        | {
+-            type: "response_body_contains" | "response_body_not_contains";
+-            value: string;
+-            caseSensitive?: boolean;
+-          }
+-        | {
+-            type: "header_exists";
+-            header: string;
+-          }
+-        | {
+-            type: "header_value";
+-            header: string;
+-            operator: "equals" | "contains";
+-            value: string;
+-          }
+-        | {
+-            type: "response_size";
+-            operator: "less_than" | "greater_than";
+-            value: number;
+-          }
+-      >
+-    >(),
+-
+-    // Multi-region configuration
+-    monitoringType: text("monitoring_type").default("local"), // 'local' or 'global'
+-    selectedRegions: jsonb("selected_regions").default(["local"]).$type<string[]>(),
+-
+-    // Metadata
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+-    createdBy: text("created_by")
++    id: text("id")
++      .$defaultFn(() => sql`encode(gen_random_bytes(8), 'hex')`)
++      .primaryKey()
++      .notNull(),
++    funnelId: text("funnel_id")
+       .notNull()
+-      .references(() => user.id),
++      .references(() => projectFunnels.id, { onDelete: "cascade" }),
++    stepOrder: integer("step_order").notNull(),
++    stepKey: text("step_key").notNull(),
++    name: text("name").notNull(),
++    pagePattern: text("page_pattern"),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "uptime_monitors_organization_id_organization_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.createdBy],
+-      foreignColumns: [user.id],
+-      name: "uptime_monitors_created_by_user_id_fk",
+-    }),
++    index("project_funnel_steps_funnel_idx").on(table.funnelId),
++    unique("project_funnel_steps_key_unique").on(table.funnelId, table.stepKey),
+   ]
+ );
+ 
+-// Monitor status tracking
+-export const uptimeMonitorStatus = pgTable(
+-  "uptime_monitor_status",
++export const projectEvents = pgTable(
++  "project_events",
+   {
+-    monitorId: integer("monitor_id")
++    id: text("id")
++      .$defaultFn(() => sql`encode(gen_random_bytes(12), 'hex')`)
+       .primaryKey()
++      .notNull(),
++    projectId: text("project_id")
+       .notNull()
+-      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
+-    lastCheckedAt: timestamp("last_checked_at", { mode: "string" }),
+-    nextCheckAt: timestamp("next_check_at", { mode: "string" }),
+-    currentStatus: text("current_status").default("unknown"), // 'up', 'down', 'unknown'
+-    consecutiveFailures: integer("consecutive_failures").default(0),
+-    consecutiveSuccesses: integer("consecutive_successes").default(0),
+-    uptimePercentage24h: real("uptime_percentage_24h"),
+-    uptimePercentage7d: real("uptime_percentage_7d"),
+-    uptimePercentage30d: real("uptime_percentage_30d"),
+-    averageResponseTime24h: real("average_response_time_24h"),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++      .references(() => projects.id, { onDelete: "cascade" }),
++    occurredAt: timestamp("occurred_at", { mode: "string" }).notNull(),
++    sessionHash: text("session_hash"),
++    userHash: text("user_hash"),
++    pageUrl: text("page_url"),
++    path: text("path"),
++    referrer: text("referrer"),
++    country: text("country"),
++    city: text("city"),
++    device: text("device"),
++    funnelId: text("funnel_id").references(() => projectFunnels.id, { onDelete: "set null" }),
++    stepKey: text("step_key"),
++    metadata: jsonb("metadata").$type<Record<string, unknown>>().default(sql`'{}'::jsonb`),
++    idempotencyKey: text("idempotency_key").notNull(),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.monitorId],
+-      foreignColumns: [uptimeMonitors.id],
+-      name: "uptime_monitor_status_monitor_id_uptime_monitors_id_fk",
+-    }),
+-    check("uptime_monitor_status_current_status_check", sql`current_status IN ('up', 'down', 'unknown')`),
+-    check("uptime_monitor_status_uptime_24h_check", sql`uptime_percentage_24h >= 0 AND uptime_percentage_24h <= 100`),
+-    check("uptime_monitor_status_uptime_7d_check", sql`uptime_percentage_7d >= 0 AND uptime_percentage_7d <= 100`),
+-    check("uptime_monitor_status_uptime_30d_check", sql`uptime_percentage_30d >= 0 AND uptime_percentage_30d <= 100`),
+-    index("uptime_monitor_status_updated_at_idx").on(table.updatedAt),
++    index("project_events_project_timestamp_idx").on(table.projectId, table.occurredAt),
++    index("project_events_project_page_idx").on(table.projectId, table.pageUrl),
++    unique("project_events_idempotency_unique").on(table.projectId, table.idempotencyKey),
+   ]
+ );
+ 
+-// Alert configuration (scaffolding)
+-export const uptimeAlerts = pgTable(
+-  "uptime_alerts",
++export const pageAggDaily = pgTable(
++  "page_agg_daily",
+   {
+-    id: serial("id").primaryKey().notNull(),
+-    monitorId: integer("monitor_id")
++    projectId: text("project_id")
+       .notNull()
+-      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
+-    alertType: text("alert_type").notNull(), // 'email', 'webhook', 'slack', etc.
+-    alertConfig: jsonb("alert_config").notNull(), // Type-specific configuration
+-    conditions: jsonb("conditions").notNull().$type<{
+-      consecutiveFailures?: number;
+-      responseTimeThresholdMs?: number;
+-      uptimePercentageThreshold?: number;
+-    }>(),
+-    enabled: boolean("enabled").default(true),
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++      .references(() => projects.id, { onDelete: "cascade" }),
++    pagePath: text("page_path"),
++    pageUrl: text("page_url"),
++    eventDate: date("event_date").notNull(),
++    visits: integer("visits").default(0).notNull(),
++    uniqueVisitors: integer("unique_visitors").default(0).notNull(),
++    conversions: integer("conversions").default(0).notNull(),
++    firstSeenAt: timestamp("first_seen_at", { mode: "string" }),
++    lastSeenAt: timestamp("last_seen_at", { mode: "string" }),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.monitorId],
+-      foreignColumns: [uptimeMonitors.id],
+-      name: "uptime_alerts_monitor_id_uptime_monitors_id_fk",
+-    }),
++    unique("page_agg_daily_unique").on(table.projectId, table.pagePath, table.pageUrl, table.eventDate),
++    index("page_agg_daily_project_date_idx").on(table.projectId, table.eventDate),
++    index("page_agg_daily_project_path_idx").on(table.projectId, table.pagePath),
+   ]
+ );
+ 
+-// Alert history (scaffolding)
+-export const uptimeAlertHistory = pgTable(
+-  "uptime_alert_history",
++export const projectOverviewDaily = pgTable(
++  "project_overview_daily",
+   {
+-    id: serial("id").primaryKey().notNull(),
+-    alertId: integer("alert_id")
+-      .notNull()
+-      .references(() => uptimeAlerts.id, { onDelete: "cascade" }),
+-    monitorId: integer("monitor_id")
++    projectId: text("project_id")
+       .notNull()
+-      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
+-    triggeredAt: timestamp("triggered_at", { mode: "string" }).defaultNow(),
+-    resolvedAt: timestamp("resolved_at", { mode: "string" }),
+-    alertData: jsonb("alert_data"), // Context about what triggered the alert
++      .references(() => projects.id, { onDelete: "cascade" }),
++    eventDate: date("event_date").notNull(),
++    visits: integer("visits").default(0).notNull(),
++    uniqueVisitors: integer("unique_visitors").default(0).notNull(),
++    firstSeenAt: timestamp("first_seen_at", { mode: "string" }),
++    lastSeenAt: timestamp("last_seen_at", { mode: "string" }),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.alertId],
+-      foreignColumns: [uptimeAlerts.id],
+-      name: "uptime_alert_history_alert_id_uptime_alerts_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.monitorId],
+-      foreignColumns: [uptimeMonitors.id],
+-      name: "uptime_alert_history_monitor_id_uptime_monitors_id_fk",
+-    }),
++    unique("project_overview_daily_unique").on(table.projectId, table.eventDate),
++    index("project_overview_daily_project_date_idx").on(table.projectId, table.eventDate),
+   ]
+ );
+ 
+-// Agent regions for VPS-based monitoring
+-export const agentRegions = pgTable("agent_regions", {
+-  code: text("code").primaryKey().notNull(), // Region code (e.g., 'us-east', 'europe')
+-  name: text("name").notNull(), // Region display name
+-  endpointUrl: text("endpoint_url").notNull(), // Agent endpoint URL
+-  enabled: boolean("enabled").default(true),
+-  lastHealthCheck: timestamp("last_health_check", { mode: "string" }),
+-  isHealthy: boolean("is_healthy").default(true),
+-});
+-
+-// Uptime incidents table
+-export const uptimeIncidents = pgTable(
+-  "uptime_incidents",
++export const projectVisitorsDaily = pgTable(
++  "project_visitors_daily",
+   {
+-    id: serial("id").primaryKey().notNull(),
+-    organizationId: text("organization_id")
+-      .notNull()
+-      .references(() => organization.id),
+-    monitorId: integer("monitor_id")
++    projectId: text("project_id")
+       .notNull()
+-      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
+-    region: text("region"), // Region where incident occurred
+-
+-    // Incident timing
+-    startTime: timestamp("start_time", { mode: "string" }).notNull(),
+-    endTime: timestamp("end_time", { mode: "string" }), // null if ongoing
+-
+-    // Status
+-    status: text("status").notNull().default("active"), // 'active', 'acknowledged', 'resolved'
+-
+-    // Acknowledgement details
+-    acknowledgedBy: text("acknowledged_by").references(() => user.id),
+-    acknowledgedAt: timestamp("acknowledged_at", { mode: "string" }),
+-
+-    // Resolution details
+-    resolvedBy: text("resolved_by").references(() => user.id),
+-    resolvedAt: timestamp("resolved_at", { mode: "string" }),
+-
+-    // Error details
+-    lastError: text("last_error"),
+-    lastErrorType: text("last_error_type"),
+-    failureCount: integer("failure_count").default(1),
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++      .references(() => projects.id, { onDelete: "cascade" }),
++    eventDate: date("event_date").notNull(),
++    visitorHash: text("visitor_hash").notNull(),
++    firstSeenAt: timestamp("first_seen_at", { mode: "string" }),
++    lastSeenAt: timestamp("last_seen_at", { mode: "string" }),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "uptime_incidents_organization_id_organization_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.monitorId],
+-      foreignColumns: [uptimeMonitors.id],
+-      name: "uptime_incidents_monitor_id_uptime_monitors_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.acknowledgedBy],
+-      foreignColumns: [user.id],
+-      name: "uptime_incidents_acknowledged_by_user_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.resolvedBy],
+-      foreignColumns: [user.id],
+-      name: "uptime_incidents_resolved_by_user_id_fk",
+-    }),
++    unique("project_visitors_daily_unique").on(table.projectId, table.eventDate, table.visitorHash),
++    index("project_visitors_daily_project_date_idx").on(table.projectId, table.eventDate),
+   ]
+ );
+ 
+-// Notification channels table
+-export const notificationChannels = pgTable(
+-  "notification_channels",
++export const projectPageVisitorsDaily = pgTable(
++  "project_page_visitors_daily",
+   {
+-    id: serial("id").primaryKey().notNull(),
+-    organizationId: text("organization_id")
+-      .notNull()
+-      .references(() => organization.id),
+-    type: text("type").notNull(), // 'email', 'discord', 'slack', 'sms'
+-    name: text("name").notNull(),
+-    enabled: boolean("enabled").default(true),
+-
+-    // Channel-specific configuration
+-    config: jsonb("config").notNull().$type<{
+-      // Email config
+-      email?: string;
+-
+-      // Discord config
+-      webhookUrl?: string;
+-
+-      // Slack config
+-      slackWebhookUrl?: string;
+-      slackChannel?: string;
+-
+-      // SMS config (placeholder)
+-      phoneNumber?: string;
+-      provider?: string;
+-    }>(),
+-
+-    // Monitor selection and notification settings
+-    monitorIds: jsonb("monitor_ids").$type<number[] | null>(), // null = all monitors
+-    triggerEvents: jsonb("trigger_events").notNull().default(["down", "recovery"]).$type<string[]>(), // 'down', 'recovery', 'degraded'
+-    cooldownMinutes: integer("cooldown_minutes").default(5), // Minimum time between notifications
+-    lastNotifiedAt: timestamp("last_notified_at", { mode: "string" }),
+-
+-    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+-    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+-    createdBy: text("created_by")
++    projectId: text("project_id")
+       .notNull()
+-      .references(() => user.id),
++      .references(() => projects.id, { onDelete: "cascade" }),
++    eventDate: date("event_date").notNull(),
++    pagePath: text("page_path"),
++    pageUrl: text("page_url"),
++    visitorHash: text("visitor_hash").notNull(),
++    firstSeenAt: timestamp("first_seen_at", { mode: "string" }),
++    lastSeenAt: timestamp("last_seen_at", { mode: "string" }),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+   },
+   table => [
+-    foreignKey({
+-      columns: [table.organizationId],
+-      foreignColumns: [organization.id],
+-      name: "notification_channels_organization_id_organization_id_fk",
+-    }),
+-    foreignKey({
+-      columns: [table.createdBy],
+-      foreignColumns: [user.id],
+-      name: "notification_channels_created_by_user_id_fk",
+-    }),
++    unique("project_page_visitors_daily_unique").on(
++      table.projectId,
++      table.eventDate,
++      table.pagePath,
++      table.pageUrl,
++      table.visitorHash
++    ),
++    index("project_page_visitors_daily_project_date_idx").on(table.projectId, table.eventDate),
++    index("project_page_visitors_daily_project_path_idx").on(table.projectId, table.pagePath),
+   ]
+ );
++
++// Telemetry table for tracking self-hosted instances
++export const telemetry = pgTable("telemetry", {
++  id: serial("id").primaryKey().notNull(),
++  instanceId: text("instance_id").notNull(),
++  timestamp: timestamp("timestamp", { mode: "string" }).notNull().defaultNow(),
++  version: text("version").notNull(),
++  tableCounts: jsonb("table_counts").notNull().$type<Record<string, number>>(),
++  clickhouseSizeGb: real("clickhouse_size_gb").notNull(),
++});
++
++// Uptime monitor definitions
++export const uptimeMonitors = pgTable(
++  "uptime_monitors",
++  {
++    id: serial("id").primaryKey().notNull(),
++    organizationId: text("organization_id")
++      .notNull()
++      .references(() => organization.id),
++    name: text("name"),
++    monitorType: text("monitor_type").notNull(), // 'http', 'tcp'
++
++    // Common settings
++    intervalSeconds: integer("interval_seconds").notNull(),
++    enabled: boolean("enabled").default(true),
++
++    // HTTP/HTTPS specific configuration
++    httpConfig: jsonb("http_config").$type<{
++      url: string;
++      method: "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH";
++      headers?: Record<string, string>;
++      body?: string;
++      auth?: {
++        type: "none" | "basic" | "bearer" | "api_key" | "custom_header";
++        credentials?: {
++          username?: string;
++          password?: string;
++          token?: string;
++          headerName?: string;
++          headerValue?: string;
++        };
++      };
++      followRedirects?: boolean;
++      timeoutMs?: number;
++      ipVersion?: "any" | "ipv4" | "ipv6";
++      userAgent?: string;
++    }>(),
++
++    // TCP specific configuration
++    tcpConfig: jsonb("tcp_config").$type<{
++      host: string;
++      port: number;
++      timeoutMs?: number;
++    }>(),
++
++    // Validation rules
++    validationRules: jsonb("validation_rules").notNull().default([]).$type<
++      Array<
++        | {
++            type: "status_code";
++            operator: "equals" | "not_equals" | "in" | "not_in";
++            value: number | number[];
++          }
++        | {
++            type: "response_time";
++            operator: "less_than" | "greater_than";
++            value: number;
++          }
++        | {
++            type: "response_body_contains" | "response_body_not_contains";
++            value: string;
++            caseSensitive?: boolean;
++          }
++        | {
++            type: "header_exists";
++            header: string;
++          }
++        | {
++            type: "header_value";
++            header: string;
++            operator: "equals" | "contains";
++            value: string;
++          }
++        | {
++            type: "response_size";
++            operator: "less_than" | "greater_than";
++            value: number;
++          }
++      >
++    >(),
++
++    // Multi-region configuration
++    monitoringType: text("monitoring_type").default("local"), // 'local' or 'global'
++    selectedRegions: jsonb("selected_regions").default(["local"]).$type<string[]>(),
++
++    // Metadata
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++    createdBy: text("created_by")
++      .notNull()
++      .references(() => user.id),
++  },
++  table => [
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "uptime_monitors_organization_id_organization_id_fk",
++    }),
++    foreignKey({
++      columns: [table.createdBy],
++      foreignColumns: [user.id],
++      name: "uptime_monitors_created_by_user_id_fk",
++    }),
++  ]
++);
++
++// Monitor status tracking
++export const uptimeMonitorStatus = pgTable(
++  "uptime_monitor_status",
++  {
++    monitorId: integer("monitor_id")
++      .primaryKey()
++      .notNull()
++      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
++    lastCheckedAt: timestamp("last_checked_at", { mode: "string" }),
++    nextCheckAt: timestamp("next_check_at", { mode: "string" }),
++    currentStatus: text("current_status").default("unknown"), // 'up', 'down', 'unknown'
++    consecutiveFailures: integer("consecutive_failures").default(0),
++    consecutiveSuccesses: integer("consecutive_successes").default(0),
++    uptimePercentage24h: real("uptime_percentage_24h"),
++    uptimePercentage7d: real("uptime_percentage_7d"),
++    uptimePercentage30d: real("uptime_percentage_30d"),
++    averageResponseTime24h: real("average_response_time_24h"),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.monitorId],
++      foreignColumns: [uptimeMonitors.id],
++      name: "uptime_monitor_status_monitor_id_uptime_monitors_id_fk",
++    }),
++    check("uptime_monitor_status_current_status_check", sql`current_status IN ('up', 'down', 'unknown')`),
++    check("uptime_monitor_status_uptime_24h_check", sql`uptime_percentage_24h >= 0 AND uptime_percentage_24h <= 100`),
++    check("uptime_monitor_status_uptime_7d_check", sql`uptime_percentage_7d >= 0 AND uptime_percentage_7d <= 100`),
++    check("uptime_monitor_status_uptime_30d_check", sql`uptime_percentage_30d >= 0 AND uptime_percentage_30d <= 100`),
++    index("uptime_monitor_status_updated_at_idx").on(table.updatedAt),
++  ]
++);
++
++// Alert configuration (scaffolding)
++export const uptimeAlerts = pgTable(
++  "uptime_alerts",
++  {
++    id: serial("id").primaryKey().notNull(),
++    monitorId: integer("monitor_id")
++      .notNull()
++      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
++    alertType: text("alert_type").notNull(), // 'email', 'webhook', 'slack', etc.
++    alertConfig: jsonb("alert_config").notNull(), // Type-specific configuration
++    conditions: jsonb("conditions").notNull().$type<{
++      consecutiveFailures?: number;
++      responseTimeThresholdMs?: number;
++      uptimePercentageThreshold?: number;
++    }>(),
++    enabled: boolean("enabled").default(true),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.monitorId],
++      foreignColumns: [uptimeMonitors.id],
++      name: "uptime_alerts_monitor_id_uptime_monitors_id_fk",
++    }),
++  ]
++);
++
++// Alert history (scaffolding)
++export const uptimeAlertHistory = pgTable(
++  "uptime_alert_history",
++  {
++    id: serial("id").primaryKey().notNull(),
++    alertId: integer("alert_id")
++      .notNull()
++      .references(() => uptimeAlerts.id, { onDelete: "cascade" }),
++    monitorId: integer("monitor_id")
++      .notNull()
++      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
++    triggeredAt: timestamp("triggered_at", { mode: "string" }).defaultNow(),
++    resolvedAt: timestamp("resolved_at", { mode: "string" }),
++    alertData: jsonb("alert_data"), // Context about what triggered the alert
++  },
++  table => [
++    foreignKey({
++      columns: [table.alertId],
++      foreignColumns: [uptimeAlerts.id],
++      name: "uptime_alert_history_alert_id_uptime_alerts_id_fk",
++    }),
++    foreignKey({
++      columns: [table.monitorId],
++      foreignColumns: [uptimeMonitors.id],
++      name: "uptime_alert_history_monitor_id_uptime_monitors_id_fk",
++    }),
++  ]
++);
++
++// Agent regions for VPS-based monitoring
++export const agentRegions = pgTable("agent_regions", {
++  code: text("code").primaryKey().notNull(), // Region code (e.g., 'us-east', 'europe')
++  name: text("name").notNull(), // Region display name
++  endpointUrl: text("endpoint_url").notNull(), // Agent endpoint URL
++  enabled: boolean("enabled").default(true),
++  lastHealthCheck: timestamp("last_health_check", { mode: "string" }),
++  isHealthy: boolean("is_healthy").default(true),
++});
++
++// Uptime incidents table
++export const uptimeIncidents = pgTable(
++  "uptime_incidents",
++  {
++    id: serial("id").primaryKey().notNull(),
++    organizationId: text("organization_id")
++      .notNull()
++      .references(() => organization.id),
++    monitorId: integer("monitor_id")
++      .notNull()
++      .references(() => uptimeMonitors.id, { onDelete: "cascade" }),
++    region: text("region"), // Region where incident occurred
++
++    // Incident timing
++    startTime: timestamp("start_time", { mode: "string" }).notNull(),
++    endTime: timestamp("end_time", { mode: "string" }), // null if ongoing
++
++    // Status
++    status: text("status").notNull().default("active"), // 'active', 'acknowledged', 'resolved'
++
++    // Acknowledgement details
++    acknowledgedBy: text("acknowledged_by").references(() => user.id),
++    acknowledgedAt: timestamp("acknowledged_at", { mode: "string" }),
++
++    // Resolution details
++    resolvedBy: text("resolved_by").references(() => user.id),
++    resolvedAt: timestamp("resolved_at", { mode: "string" }),
++
++    // Error details
++    lastError: text("last_error"),
++    lastErrorType: text("last_error_type"),
++    failureCount: integer("failure_count").default(1),
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++  },
++  table => [
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "uptime_incidents_organization_id_organization_id_fk",
++    }),
++    foreignKey({
++      columns: [table.monitorId],
++      foreignColumns: [uptimeMonitors.id],
++      name: "uptime_incidents_monitor_id_uptime_monitors_id_fk",
++    }),
++    foreignKey({
++      columns: [table.acknowledgedBy],
++      foreignColumns: [user.id],
++      name: "uptime_incidents_acknowledged_by_user_id_fk",
++    }),
++    foreignKey({
++      columns: [table.resolvedBy],
++      foreignColumns: [user.id],
++      name: "uptime_incidents_resolved_by_user_id_fk",
++    }),
++  ]
++);
++
++// Notification channels table
++export const notificationChannels = pgTable(
++  "notification_channels",
++  {
++    id: serial("id").primaryKey().notNull(),
++    organizationId: text("organization_id")
++      .notNull()
++      .references(() => organization.id),
++    type: text("type").notNull(), // 'email', 'discord', 'slack', 'sms'
++    name: text("name").notNull(),
++    enabled: boolean("enabled").default(true),
++
++    // Channel-specific configuration
++    config: jsonb("config").notNull().$type<{
++      // Email config
++      email?: string;
++
++      // Discord config
++      webhookUrl?: string;
++
++      // Slack config
++      slackWebhookUrl?: string;
++      slackChannel?: string;
++
++      // SMS config (placeholder)
++      phoneNumber?: string;
++      provider?: string;
++    }>(),
++
++    // Monitor selection and notification settings
++    monitorIds: jsonb("monitor_ids").$type<number[] | null>(), // null = all monitors
++    triggerEvents: jsonb("trigger_events").notNull().default(["down", "recovery"]).$type<string[]>(), // 'down', 'recovery', 'degraded'
++    cooldownMinutes: integer("cooldown_minutes").default(5), // Minimum time between notifications
++    lastNotifiedAt: timestamp("last_notified_at", { mode: "string" }),
++
++    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
++    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
++    createdBy: text("created_by")
++      .notNull()
++      .references(() => user.id),
++  },
++  table => [
++    foreignKey({
++      columns: [table.organizationId],
++      foreignColumns: [organization.id],
++      name: "notification_channels_organization_id_organization_id_fk",
++    }),
++    foreignKey({
++      columns: [table.createdBy],
++      foreignColumns: [user.id],
++      name: "notification_channels_created_by_user_id_fk",
++    }),
++  ]
++);
+diff --git a/server/src/index.ts b/server/src/index.ts
+index 0ba6fd2..b8eb845 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -1,343 +1,346 @@
+-import cors from "@fastify/cors";
+-import fastifyStatic from "@fastify/static";
+-import { toNodeHandler } from "better-auth/node";
+-import Fastify from "fastify";
+-import { dirname, join } from "path";
+-import { fileURLToPath } from "url";
++import cors from "@fastify/cors";
++import fastifyStatic from "@fastify/static";
++import { toNodeHandler } from "better-auth/node";
++import Fastify from "fastify";
++import { dirname, join } from "path";
++import { fileURLToPath } from "url";
+ import { collectTelemetry } from "./api/admin/collectTelemetry.js";
+-import { getAdminOrganizations } from "./api/admin/getAdminOrganizations.js";
+-import { getAdminSites } from "./api/admin/getAdminSites.js";
+-import { getEventNames } from "./api/analytics/events/getEventNames.js";
+-import { getEventProperties } from "./api/analytics/events/getEventProperties.js";
+-import { getEvents } from "./api/analytics/events/getEvents.js";
+-import { getOutboundLinks } from "./api/analytics/events/getOutboundLinks.js";
+-import { createFunnel } from "./api/analytics/funnels/createFunnel.js";
+-import { deleteFunnel } from "./api/analytics/funnels/deleteFunnel.js";
+-import { getFunnel } from "./api/analytics/funnels/getFunnel.js";
+-import { getFunnels } from "./api/analytics/funnels/getFunnels.js";
+-import { getErrorBucketed } from "./api/analytics/getErrorBucketed.js";
+-import { getErrorEvents } from "./api/analytics/getErrorEvents.js";
+-import { getErrorNames } from "./api/analytics/getErrorNames.js";
+-import { getJourneys } from "./api/analytics/getJourneys.js";
+-import { getSessionLocations } from "./api/analytics/getSessionLocations.js";
+-import { getLiveUsercount } from "./api/analytics/getLiveUsercount.js";
+-import { getOrgEventCount } from "./api/analytics/getOrgEventCount.js";
+-import { getOverview } from "./api/analytics/getOverview.js";
+-import { getOverviewBucketed } from "./api/analytics/getOverviewBucketed.js";
+-import { getPageTitles } from "./api/analytics/getPageTitles.js";
+-import { getRetention } from "./api/analytics/getRetention.js";
+-import { getSession } from "./api/analytics/getSession.js";
+-import { getSessions } from "./api/analytics/getSessions.js";
+-import { getSingleCol } from "./api/analytics/getSingleCol.js";
+-import { getUserInfo } from "./api/analytics/getUserInfo.js";
+-import { getUserSessionCount } from "./api/analytics/getUserSessionCount.js";
+-import { getUserSessions } from "./api/analytics/getUserSessions.js";
+-import { getUsers } from "./api/analytics/getUsers.js";
+-import { createGoal } from "./api/analytics/goals/createGoal.js";
+-import { deleteGoal } from "./api/analytics/goals/deleteGoal.js";
+-import { getGoals } from "./api/analytics/goals/getGoals.js";
+-import { updateGoal } from "./api/analytics/goals/updateGoal.js";
+-import { getPerformanceByDimension } from "./api/analytics/performance/getPerformanceByDimension.js";
+-import { getPerformanceOverview } from "./api/analytics/performance/getPerformanceOverview.js";
+-import { getPerformanceTimeSeries } from "./api/analytics/performance/getPerformanceTimeSeries.js";
+-import { getConfig } from "./api/getConfig.js";
+-import { getSessionReplayEvents } from "./api/sessionReplay/getSessionReplayEvents.js";
+-import { getSessionReplays } from "./api/sessionReplay/getSessionReplays.js";
+-import { recordSessionReplay } from "./api/sessionReplay/recordSessionReplay.js";
+-import { addSite } from "./api/sites/addSite.js";
+-import { updateSiteConfig } from "./api/sites/updateSiteConfig.js";
+-import { deleteSite } from "./api/sites/deleteSite.js";
+-import { getSite } from "./api/sites/getSite.js";
+-import { getSiteApiConfig } from "./api/sites/getSiteApiConfig.js";
+-import { getSiteExcludedIPs } from "./api/sites/getSiteExcludedIPs.js";
+-import { getSiteHasData } from "./api/sites/getSiteHasData.js";
+-import { getSiteIsPublic } from "./api/sites/getSiteIsPublic.js";
+-import { getSitesFromOrg } from "./api/sites/getSitesFromOrg.js";
+-import { updateSiteApiConfig } from "./api/sites/updateSiteApiConfig.js";
+-import { createCheckoutSession } from "./api/stripe/createCheckoutSession.js";
+-import { createPortalSession } from "./api/stripe/createPortalSession.js";
+-import { getSubscription } from "./api/stripe/getSubscription.js";
+-import { previewSubscriptionUpdate } from "./api/stripe/previewSubscriptionUpdate.js";
+-import { updateSubscription } from "./api/stripe/updateSubscription.js";
+-import { handleWebhook } from "./api/stripe/webhook.js";
+-import { addUserToOrganization } from "./api/user/addUserToOrganization.js";
+-import { getUserOrganizations } from "./api/user/getUserOrganizations.js";
+-import { listOrganizationMembers } from "./api/user/listOrganizationMembers.js";
+-import { updateAccountSettings } from "./api/user/updateAccountSettings.js";
+-import { initializeClickhouse } from "./db/clickhouse/clickhouse.js";
+-import { initPostgres } from "./db/postgres/initPostgres.js";
+-import { getSessionFromReq, mapHeaders } from "./lib/auth-utils.js";
+-import { auth } from "./lib/auth.js";
+-import { IS_CLOUD } from "./lib/const.js";
+-import { siteConfig } from "./lib/siteConfig.js";
+-import { trackEvent } from "./services/tracker/trackEvent.js";
+-// need to import telemetry service here to start it
+-import { telemetryService } from "./services/telemetryService.js";
+-import { weeklyReportService } from "./services/weekyReports/weeklyReportService.js";
+-import { extractSiteId } from "./utils.js";
++import { getAdminOrganizations } from "./api/admin/getAdminOrganizations.js";
++import { getAdminSites } from "./api/admin/getAdminSites.js";
++import { getEventNames } from "./api/analytics/events/getEventNames.js";
++import { getEventProperties } from "./api/analytics/events/getEventProperties.js";
++import { getEvents } from "./api/analytics/events/getEvents.js";
++import { getOutboundLinks } from "./api/analytics/events/getOutboundLinks.js";
++import { createFunnel } from "./api/analytics/funnels/createFunnel.js";
++import { deleteFunnel } from "./api/analytics/funnels/deleteFunnel.js";
++import { getFunnel } from "./api/analytics/funnels/getFunnel.js";
++import { getFunnels } from "./api/analytics/funnels/getFunnels.js";
++import { getErrorBucketed } from "./api/analytics/getErrorBucketed.js";
++import { getErrorEvents } from "./api/analytics/getErrorEvents.js";
++import { getErrorNames } from "./api/analytics/getErrorNames.js";
++import { getJourneys } from "./api/analytics/getJourneys.js";
++import { getSessionLocations } from "./api/analytics/getSessionLocations.js";
++import { getLiveUsercount } from "./api/analytics/getLiveUsercount.js";
++import { getOrgEventCount } from "./api/analytics/getOrgEventCount.js";
++import { getOverview } from "./api/analytics/getOverview.js";
++import { getOverviewBucketed } from "./api/analytics/getOverviewBucketed.js";
++import { getPageTitles } from "./api/analytics/getPageTitles.js";
++import { getRetention } from "./api/analytics/getRetention.js";
++import { getSession } from "./api/analytics/getSession.js";
++import { getSessions } from "./api/analytics/getSessions.js";
++import { getSingleCol } from "./api/analytics/getSingleCol.js";
++import { getUserInfo } from "./api/analytics/getUserInfo.js";
++import { getUserSessionCount } from "./api/analytics/getUserSessionCount.js";
++import { getUserSessions } from "./api/analytics/getUserSessions.js";
++import { getUsers } from "./api/analytics/getUsers.js";
++import { createGoal } from "./api/analytics/goals/createGoal.js";
++import { deleteGoal } from "./api/analytics/goals/deleteGoal.js";
++import { getGoals } from "./api/analytics/goals/getGoals.js";
++import { updateGoal } from "./api/analytics/goals/updateGoal.js";
++import { getPerformanceByDimension } from "./api/analytics/performance/getPerformanceByDimension.js";
++import { getPerformanceOverview } from "./api/analytics/performance/getPerformanceOverview.js";
++import { getPerformanceTimeSeries } from "./api/analytics/performance/getPerformanceTimeSeries.js";
++import { getConfig } from "./api/getConfig.js";
++import { getSessionReplayEvents } from "./api/sessionReplay/getSessionReplayEvents.js";
++import { getSessionReplays } from "./api/sessionReplay/getSessionReplays.js";
++import { recordSessionReplay } from "./api/sessionReplay/recordSessionReplay.js";
++import { addSite } from "./api/sites/addSite.js";
++import { updateSiteConfig } from "./api/sites/updateSiteConfig.js";
++import { deleteSite } from "./api/sites/deleteSite.js";
++import { getSite } from "./api/sites/getSite.js";
++import { getSiteApiConfig } from "./api/sites/getSiteApiConfig.js";
++import { getSiteExcludedIPs } from "./api/sites/getSiteExcludedIPs.js";
++import { getSiteHasData } from "./api/sites/getSiteHasData.js";
++import { getSiteIsPublic } from "./api/sites/getSiteIsPublic.js";
++import { getSitesFromOrg } from "./api/sites/getSitesFromOrg.js";
++import { updateSiteApiConfig } from "./api/sites/updateSiteApiConfig.js";
++import { createCheckoutSession } from "./api/stripe/createCheckoutSession.js";
++import { createPortalSession } from "./api/stripe/createPortalSession.js";
++import { getSubscription } from "./api/stripe/getSubscription.js";
++import { previewSubscriptionUpdate } from "./api/stripe/previewSubscriptionUpdate.js";
++import { updateSubscription } from "./api/stripe/updateSubscription.js";
++import { handleWebhook } from "./api/stripe/webhook.js";
++import { addUserToOrganization } from "./api/user/addUserToOrganization.js";
++import { getUserOrganizations } from "./api/user/getUserOrganizations.js";
++import { listOrganizationMembers } from "./api/user/listOrganizationMembers.js";
++import { updateAccountSettings } from "./api/user/updateAccountSettings.js";
++import { initializeClickhouse } from "./db/clickhouse/clickhouse.js";
++import { initPostgres } from "./db/postgres/initPostgres.js";
++import { getSessionFromReq, mapHeaders } from "./lib/auth-utils.js";
++import { auth } from "./lib/auth.js";
++import { IS_CLOUD } from "./lib/const.js";
++import { siteConfig } from "./lib/siteConfig.js";
++import { trackEvent } from "./services/tracker/trackEvent.js";
++// need to import telemetry service here to start it
++import { telemetryService } from "./services/telemetryService.js";
++import { weeklyReportService } from "./services/weekyReports/weeklyReportService.js";
++import { extractSiteId } from "./utils.js";
+ import { getTrackingConfig } from "./api/sites/getTrackingConfig.js";
+-
+-const __filename = fileURLToPath(import.meta.url);
+-const __dirname = dirname(__filename);
+-
+-const hasAxiom = !!(process.env.AXIOM_DATASET && process.env.AXIOM_TOKEN);
+-
+-const server = Fastify({
+-  logger: {
+-    level: process.env.LOG_LEVEL || (process.env.NODE_ENV === "development" ? "debug" : "info"),
+-    transport:
+-      process.env.NODE_ENV === "production" && IS_CLOUD && hasAxiom
+-        ? {
+-            targets: [
+-              // Send to Axiom
+-              {
+-                target: "@axiomhq/pino",
+-                level: process.env.LOG_LEVEL || "info",
+-                options: {
+-                  dataset: process.env.AXIOM_DATASET,
+-                  token: process.env.AXIOM_TOKEN,
+-                },
+-              },
+-              // Pretty print to stdout for Docker logs
+-              {
+-                target: "pino-pretty",
+-                level: process.env.LOG_LEVEL || "info",
+-                options: {
+-                  colorize: true,
+-                  singleLine: true,
+-                  translateTime: "HH:MM:ss",
+-                  ignore: "pid,hostname,name",
+-                  destination: 1, // stdout
+-                },
+-              },
+-            ],
+-          }
+-        : process.env.NODE_ENV === "development"
+-          ? {
+-              target: "pino-pretty",
+-              options: {
+-                colorize: true,
+-                singleLine: true,
+-                translateTime: "HH:MM:ss",
+-                ignore: "pid,hostname,name",
+-              },
+-            }
+-          : undefined, // Production without Axiom - plain JSON to stdout
+-    serializers: {
+-      req(request) {
+-        return {
+-          method: request.method,
+-          url: request.url,
+-          path: request.url,
+-          parameters: request.params,
+-          headers: request.headers,
+-        };
+-      },
+-      res(reply) {
+-        return {
+-          statusCode: reply.statusCode,
+-        };
+-      },
+-    },
+-  },
+-  maxParamLength: 1500,
+-  trustProxy: true,
+-  bodyLimit: 10 * 1024 * 1024, // 10MB limit for session replay data
+-});
+-
+-server.register(cors, {
+-  origin: (_origin, callback) => {
+-    callback(null, true);
+-  },
+-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+-  credentials: true,
+-});
+-
+-// Serve static files
+-server.register(fastifyStatic, {
+-  root: join(__dirname, "../public"),
+-  prefix: "/", // or whatever prefix you need
+-});
+-
+-server.register(
+-  async (fastify, options) => {
+-    await fastify.register(fastify => {
+-      const authHandler = toNodeHandler(options.auth);
+-
+-      fastify.addContentTypeParser(
+-        "application/json",
+-        /* c8 ignore next 3 */
+-        (_request, _payload, done) => {
+-          done(null, null);
+-        }
+-      );
+-
+-      fastify.all("/api/auth/*", async (request, reply: any) => {
+-        reply.raw.setHeaders(mapHeaders(reply.getHeaders()));
+-        await authHandler(request.raw, reply.raw);
+-      });
+-      fastify.all("/auth/*", async (request, reply: any) => {
+-        reply.raw.setHeaders(mapHeaders(reply.getHeaders()));
+-        await authHandler(request.raw, reply.raw);
+-      });
+-    });
+-  },
+-  { auth: auth! }
+-);
+-
++import { apiV1Routes } from "./api/v1/index.js";
++import type { ProjectRecord } from "./services/projects/projectService.js";
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = dirname(__filename);
++
++const hasAxiom = !!(process.env.AXIOM_DATASET && process.env.AXIOM_TOKEN);
++
++const server = Fastify({
++  logger: {
++    level: process.env.LOG_LEVEL || (process.env.NODE_ENV === "development" ? "debug" : "info"),
++    transport:
++      process.env.NODE_ENV === "production" && IS_CLOUD && hasAxiom
++        ? {
++            targets: [
++              // Send to Axiom
++              {
++                target: "@axiomhq/pino",
++                level: process.env.LOG_LEVEL || "info",
++                options: {
++                  dataset: process.env.AXIOM_DATASET,
++                  token: process.env.AXIOM_TOKEN,
++                },
++              },
++              // Pretty print to stdout for Docker logs
++              {
++                target: "pino-pretty",
++                level: process.env.LOG_LEVEL || "info",
++                options: {
++                  colorize: true,
++                  singleLine: true,
++                  translateTime: "HH:MM:ss",
++                  ignore: "pid,hostname,name",
++                  destination: 1, // stdout
++                },
++              },
++            ],
++          }
++        : process.env.NODE_ENV === "development"
++          ? {
++              target: "pino-pretty",
++              options: {
++                colorize: true,
++                singleLine: true,
++                translateTime: "HH:MM:ss",
++                ignore: "pid,hostname,name",
++              },
++            }
++          : undefined, // Production without Axiom - plain JSON to stdout
++    serializers: {
++      req(request) {
++        return {
++          method: request.method,
++          url: request.url,
++          path: request.url,
++          parameters: request.params,
++          headers: request.headers,
++        };
++      },
++      res(reply) {
++        return {
++          statusCode: reply.statusCode,
++        };
++      },
++    },
++  },
++  maxParamLength: 1500,
++  trustProxy: true,
++  bodyLimit: 10 * 1024 * 1024, // 10MB limit for session replay data
++});
++
++server.register(cors, {
++  origin: (_origin, callback) => {
++    callback(null, true);
++  },
++  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
++  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
++  credentials: true,
++});
++
++// Serve static files
++server.register(fastifyStatic, {
++  root: join(__dirname, "../public"),
++  prefix: "/", // or whatever prefix you need
++});
++
++server.register(
++  async (fastify, options) => {
++    await fastify.register(fastify => {
++      const authHandler = toNodeHandler(options.auth);
++
++      fastify.addContentTypeParser(
++        "application/json",
++        /* c8 ignore next 3 */
++        (_request, _payload, done) => {
++          done(null, null);
++        }
++      );
++
++      fastify.all("/api/auth/*", async (request, reply: any) => {
++        reply.raw.setHeaders(mapHeaders(reply.getHeaders()));
++        await authHandler(request.raw, reply.raw);
++      });
++      fastify.all("/auth/*", async (request, reply: any) => {
++        reply.raw.setHeaders(mapHeaders(reply.getHeaders()));
++        await authHandler(request.raw, reply.raw);
++      });
++    });
++  },
++  { auth: auth! }
++);
++
+ const PUBLIC_ROUTES: string[] = [
+   "/api/health",
+   "/api/track",
+   "/track",
+   "/api/script.js",
+-  "/api/script-full.js",
+-  "/api/replay.js",
+-  "/api/metrics.js",
+-  "/api/config",
+-  "/api/auth",
+-  "/api/auth/callback/google",
+-  "/api/auth/callback/github",
++  "/api/script-full.js",
++  "/api/replay.js",
++  "/api/metrics.js",
++  "/api/config",
++  "/api/auth",
++  "/api/auth/callback/google",
++  "/api/auth/callback/github",
+   "/api/stripe/webhook",
+   "/api/session-replay/record",
+   "/api/admin/telemetry",
+   "/api/site/:siteId/tracking-config",
++  "/api/v1",
+ ];
+-
+-// Define analytics routes that can be public
+-const ANALYTICS_ROUTES = [
+-  "/api/live-user-count/",
+-  "/api/overview/",
+-  "/api/overview-bucketed/",
+-  "/api/error-bucketed/",
+-  "/api/single-col/",
+-  "/api/page-titles/",
+-  "/api/retention/",
+-  "/api/site-has-data/",
+-  "/api/site-is-public/",
+-  "/api/sessions/",
+-  "/api/session/",
+-  "/api/users/",
+-  "/api/user/info/",
+-  "/api/user/session-count/",
+-  "/api/session-locations/",
+-  "/api/funnels/",
+-  "/api/funnel/",
+-  "/api/journeys/",
+-  "/api/goals/",
+-  "/api/goal/",
+-  "/api/analytics/events/names/",
+-  "/api/analytics/events/properties/",
+-  "/api/events/",
+-  "/api/events/outbound/",
+-  "/api/get-site",
+-  "/api/performance/overview/",
+-  "/api/performance/time-series/",
+-  "/api/performance/by-path/",
+-  "/api/performance/by-dimension/",
+-  "/api/error-names/",
+-  "/api/error-events/",
+-  "/api/error-bucketed/",
+-  "/api/session-replay/",
+-];
+-
+-server.addHook("onRequest", async (request, reply) => {
+-  const { url } = request.raw;
+-
+-  if (!url) return;
+-
+-  let processedUrl = url;
+-
+-  // Bypass auth for public routes (now including the prepended /api)
+-  if (PUBLIC_ROUTES.some(route => processedUrl.includes(route))) {
+-    return;
+-  }
+-
+-  // Check if it's an analytics route and get site ID (now including the prepended /api)
+-  if (ANALYTICS_ROUTES.some(route => processedUrl.startsWith(route))) {
+-    const siteId = extractSiteId(processedUrl);
+-
+-    if (siteId && (await siteConfig.getConfig(siteId))?.public) {
+-      // Skip auth check for public sites
+-      return;
+-    }
+-  }
+-
+-  try {
+-    const session = await getSessionFromReq(request);
+-
+-    if (!session) {
+-      return reply.status(401).send({ error: "Unauthorized 1" });
+-    }
+-
+-    // Attach session user info to request
+-    request.user = session.user;
+-  } catch (err) {
+-    console.error("Auth Error:", err);
+-    return reply.status(500).send({ error: "Auth check failed" });
+-  }
+-});
+-
+-// Serve analytics scripts with generic names to avoid ad-blocker detection
+-server.get("/api/script.js", async (_, reply) => reply.sendFile("script.js"));
+-server.get("/api/replay.js", async (_, reply) => reply.sendFile("rrweb.min.js"));
+-server.get("/api/metrics.js", async (_, reply) => reply.sendFile("web-vitals.iife.js"));
+-
+-// WEB & PRODUCT ANALYTICS
+-
+-// This endpoint gets called a lot so we don't want to log it
+-server.get("/api/live-user-count/:site", { logLevel: "silent" }, getLiveUsercount);
+-server.get("/api/overview/:site", getOverview);
+-server.get("/api/overview-bucketed/:site", getOverviewBucketed);
+-server.get("/api/single-col/:site", getSingleCol);
+-server.get("/api/page-titles/:site", getPageTitles);
+-server.get("/api/error-names/:site", getErrorNames);
+-server.get("/api/error-events/:site", getErrorEvents);
+-server.get("/api/error-bucketed/:site", getErrorBucketed);
+-server.get("/api/retention/:site", getRetention);
+-server.get("/api/site-has-data/:site", getSiteHasData);
+-server.get("/api/site-is-public/:site", getSiteIsPublic);
+-server.get("/api/sessions/:site", getSessions);
+-server.get("/api/session/:sessionId/:site", getSession);
+-server.get("/api/events/:site", getEvents);
+-server.get("/api/users/:site", getUsers);
+-server.get("/api/user/:userId/sessions/:site", getUserSessions);
+-server.get("/api/user/session-count/:site", getUserSessionCount);
+-server.get("/api/user/info/:userId/:site", getUserInfo);
+-server.get("/api/session-locations/:site", getSessionLocations);
+-server.get("/api/funnels/:site", getFunnels);
+-server.get("/api/journeys/:site", getJourneys);
+-server.post("/api/funnel/:site", getFunnel);
+-server.post("/api/funnel/create/:site", createFunnel);
+-server.delete("/api/funnel/:funnelId", deleteFunnel);
+-server.get("/api/goals/:site", getGoals);
+-server.post("/api/goal/create", createGoal);
+-server.delete("/api/goal/:goalId", deleteGoal);
+-server.put("/api/goal/update", updateGoal);
+-server.get("/api/events/names/:site", getEventNames);
+-server.get("/api/events/properties/:site", getEventProperties);
+-server.get("/api/events/outbound/:site", getOutboundLinks);
+-server.get("/api/org-event-count/:organizationId", getOrgEventCount);
+-
+-// Performance Analytics
+-server.get("/api/performance/overview/:site", getPerformanceOverview);
+-server.get("/api/performance/time-series/:site", getPerformanceTimeSeries);
+-server.get("/api/performance/by-dimension/:site", getPerformanceByDimension);
+-
+-// Session Replay
+-server.post("/api/session-replay/record/:site", recordSessionReplay);
+-server.get("/api/session-replay/list/:site", getSessionReplays);
+-server.get("/api/session-replay/:sessionId/:site", getSessionReplayEvents);
+-
+-// Administrative
+-server.get("/api/config", getConfig);
+-server.post("/api/add-site", addSite);
+-server.post("/api/update-site-config", updateSiteConfig);
+-server.post("/api/delete-site/:id", deleteSite);
+-server.get("/api/get-sites-from-org/:organizationId", getSitesFromOrg);
+-server.get("/api/get-site/:id", getSite);
+-server.get("/api/site/:siteId/api-config", getSiteApiConfig);
+-server.post("/api/site/:siteId/api-config", updateSiteApiConfig);
++
++// Define analytics routes that can be public
++const ANALYTICS_ROUTES = [
++  "/api/live-user-count/",
++  "/api/overview/",
++  "/api/overview-bucketed/",
++  "/api/error-bucketed/",
++  "/api/single-col/",
++  "/api/page-titles/",
++  "/api/retention/",
++  "/api/site-has-data/",
++  "/api/site-is-public/",
++  "/api/sessions/",
++  "/api/session/",
++  "/api/users/",
++  "/api/user/info/",
++  "/api/user/session-count/",
++  "/api/session-locations/",
++  "/api/funnels/",
++  "/api/funnel/",
++  "/api/journeys/",
++  "/api/goals/",
++  "/api/goal/",
++  "/api/analytics/events/names/",
++  "/api/analytics/events/properties/",
++  "/api/events/",
++  "/api/events/outbound/",
++  "/api/get-site",
++  "/api/performance/overview/",
++  "/api/performance/time-series/",
++  "/api/performance/by-path/",
++  "/api/performance/by-dimension/",
++  "/api/error-names/",
++  "/api/error-events/",
++  "/api/error-bucketed/",
++  "/api/session-replay/",
++];
++
++server.addHook("onRequest", async (request, reply) => {
++  const { url } = request.raw;
++
++  if (!url) return;
++
++  let processedUrl = url;
++
++  // Bypass auth for public routes (now including the prepended /api)
++  if (PUBLIC_ROUTES.some(route => processedUrl.includes(route))) {
++    return;
++  }
++
++  // Check if it's an analytics route and get site ID (now including the prepended /api)
++  if (ANALYTICS_ROUTES.some(route => processedUrl.startsWith(route))) {
++    const siteId = extractSiteId(processedUrl);
++
++    if (siteId && (await siteConfig.getConfig(siteId))?.public) {
++      // Skip auth check for public sites
++      return;
++    }
++  }
++
++  try {
++    const session = await getSessionFromReq(request);
++
++    if (!session) {
++      return reply.status(401).send({ error: "Unauthorized 1" });
++    }
++
++    // Attach session user info to request
++    request.user = session.user;
++  } catch (err) {
++    console.error("Auth Error:", err);
++    return reply.status(500).send({ error: "Auth check failed" });
++  }
++});
++
++// Serve analytics scripts with generic names to avoid ad-blocker detection
++server.get("/api/script.js", async (_, reply) => reply.sendFile("script.js"));
++server.get("/api/replay.js", async (_, reply) => reply.sendFile("rrweb.min.js"));
++server.get("/api/metrics.js", async (_, reply) => reply.sendFile("web-vitals.iife.js"));
++
++// WEB & PRODUCT ANALYTICS
++
++// This endpoint gets called a lot so we don't want to log it
++server.get("/api/live-user-count/:site", { logLevel: "silent" }, getLiveUsercount);
++server.get("/api/overview/:site", getOverview);
++server.get("/api/overview-bucketed/:site", getOverviewBucketed);
++server.get("/api/single-col/:site", getSingleCol);
++server.get("/api/page-titles/:site", getPageTitles);
++server.get("/api/error-names/:site", getErrorNames);
++server.get("/api/error-events/:site", getErrorEvents);
++server.get("/api/error-bucketed/:site", getErrorBucketed);
++server.get("/api/retention/:site", getRetention);
++server.get("/api/site-has-data/:site", getSiteHasData);
++server.get("/api/site-is-public/:site", getSiteIsPublic);
++server.get("/api/sessions/:site", getSessions);
++server.get("/api/session/:sessionId/:site", getSession);
++server.get("/api/events/:site", getEvents);
++server.get("/api/users/:site", getUsers);
++server.get("/api/user/:userId/sessions/:site", getUserSessions);
++server.get("/api/user/session-count/:site", getUserSessionCount);
++server.get("/api/user/info/:userId/:site", getUserInfo);
++server.get("/api/session-locations/:site", getSessionLocations);
++server.get("/api/funnels/:site", getFunnels);
++server.get("/api/journeys/:site", getJourneys);
++server.post("/api/funnel/:site", getFunnel);
++server.post("/api/funnel/create/:site", createFunnel);
++server.delete("/api/funnel/:funnelId", deleteFunnel);
++server.get("/api/goals/:site", getGoals);
++server.post("/api/goal/create", createGoal);
++server.delete("/api/goal/:goalId", deleteGoal);
++server.put("/api/goal/update", updateGoal);
++server.get("/api/events/names/:site", getEventNames);
++server.get("/api/events/properties/:site", getEventProperties);
++server.get("/api/events/outbound/:site", getOutboundLinks);
++server.get("/api/org-event-count/:organizationId", getOrgEventCount);
++
++// Performance Analytics
++server.get("/api/performance/overview/:site", getPerformanceOverview);
++server.get("/api/performance/time-series/:site", getPerformanceTimeSeries);
++server.get("/api/performance/by-dimension/:site", getPerformanceByDimension);
++
++// Session Replay
++server.post("/api/session-replay/record/:site", recordSessionReplay);
++server.get("/api/session-replay/list/:site", getSessionReplays);
++server.get("/api/session-replay/:sessionId/:site", getSessionReplayEvents);
++
++// Administrative
++server.get("/api/config", getConfig);
++server.post("/api/add-site", addSite);
++server.post("/api/update-site-config", updateSiteConfig);
++server.post("/api/delete-site/:id", deleteSite);
++server.get("/api/get-sites-from-org/:organizationId", getSitesFromOrg);
++server.get("/api/get-site/:id", getSite);
++server.get("/api/site/:siteId/api-config", getSiteApiConfig);
++server.post("/api/site/:siteId/api-config", updateSiteApiConfig);
+ server.get("/api/site/:siteId/tracking-config", getTrackingConfig);
+ server.get("/api/site/:siteId/excluded-ips", getSiteExcludedIPs);
+ server.get("/api/list-organization-members/:organizationId", listOrganizationMembers);
+@@ -345,147 +348,150 @@ server.get("/api/user/organizations", getUserOrganizations);
+ server.post("/api/add-user-to-organization", addUserToOrganization);
+ server.post("/api/user/account-settings", updateAccountSettings);
+ 
+-// UPTIME MONITORING
+-// Only register uptime routes when IS_CLOUD is true (Redis is available)
+-// if (IS_CLOUD) {
+-//   // Dynamically import uptime modules only when needed
+-//   const { getMonitors } = await import("./api/uptime/getMonitors.js");
+-//   const { getMonitor } = await import("./api/uptime/getMonitor.js");
+-//   const { createMonitor } = await import("./api/uptime/createMonitor.js");
+-//   const { updateMonitor } = await import("./api/uptime/updateMonitor.js");
+-//   const { deleteMonitor } = await import("./api/uptime/deleteMonitor.js");
+-//   const { getMonitorEvents } = await import("./api/uptime/getMonitorEvents.js");
+-//   const { getMonitorStats } = await import("./api/uptime/getMonitorStats.js");
+-//   const { getMonitorUptimeBuckets } = await import("./api/uptime/getMonitorUptimeBuckets.js");
+-//   const { getMonitorStatus } = await import("./api/uptime/getMonitorStatus.js");
+-//   const { getMonitorUptime } = await import("./api/uptime/getMonitorUptime.js");
+-//   const { getRegions } = await import("./api/uptime/getRegions.js");
+-//   const { incidentsRoutes } = await import("./api/uptime/incidents.js");
+-//   const { notificationRoutes } = await import("./api/uptime/notifications.js");
+-
+-//   server.get("/api/uptime/monitors", getMonitors);
+-//   server.get("/api/uptime/monitors/:monitorId", getMonitor);
+-//   server.post("/api/uptime/monitors", createMonitor);
+-//   server.put("/api/uptime/monitors/:monitorId", updateMonitor);
+-//   server.delete("/api/uptime/monitors/:monitorId", deleteMonitor);
+-//   server.get("/api/uptime/monitors/:monitorId/events", getMonitorEvents);
+-//   server.get("/api/uptime/monitors/:monitorId/stats", getMonitorStats);
+-//   server.get("/api/uptime/monitors/:monitorId/status", getMonitorStatus);
+-//   server.get("/api/uptime/monitors/:monitorId/uptime", getMonitorUptime);
+-//   server.get("/api/uptime/monitors/:monitorId/buckets", getMonitorUptimeBuckets);
+-//   server.get("/api/uptime/regions", getRegions);
+-
+-//   // Register incidents routes
+-//   server.register(incidentsRoutes);
+-
+-//   // Register notification routes
+-//   server.register(notificationRoutes);
+-// }
+-
+-// STRIPE & ADMIN
+-
+-if (IS_CLOUD) {
+-  // Stripe Routes
+-  server.post("/api/stripe/create-checkout-session", createCheckoutSession);
+-  server.post("/api/stripe/create-portal-session", createPortalSession);
+-  server.post("/api/stripe/preview-subscription-update", previewSubscriptionUpdate);
+-  server.post("/api/stripe/update-subscription", updateSubscription);
+-  server.get("/api/stripe/subscription", getSubscription);
+-  server.post("/api/stripe/webhook", { config: { rawBody: true } }, handleWebhook); // Use rawBody parser config for webhook
+-
+-  // Admin Routes
+-  server.get("/api/admin/sites", getAdminSites);
+-  server.get("/api/admin/organizations", getAdminOrganizations);
+-  server.post("/api/admin/telemetry", collectTelemetry);
+-}
+-
+-server.post("/track", trackEvent);
+-server.post("/api/track", trackEvent);
+-
+-server.get("/api/health", { logLevel: "silent" }, (_, reply) => reply.send("OK"));
+-
+-const start = async () => {
+-  try {
+-    console.info("Starting server...");
+-    await Promise.all([initializeClickhouse(), initPostgres()]);
+-
+-    telemetryService.startTelemetryCron();
+-    if (IS_CLOUD) {
+-      weeklyReportService.startWeeklyReportCron();
+-    }
+-
+-    // Start the server first
+-    await server.listen({ port: 3001, host: "0.0.0.0" });
+-    server.log.info("Server is listening on http://0.0.0.0:3001");
+-
+-    // Test Axiom logging
+-    if (hasAxiom) {
+-      server.log.info({ axiom: true, dataset: process.env.AXIOM_DATASET }, "Axiom logging is configured");
+-    }
+-
+-    // if (process.env.NODE_ENV === "production") {
+-    //   // Initialize uptime monitoring service in the background (non-blocking)
+-    //   uptimeService
+-    //     .initialize()
+-    //     .then(() => {
+-    //       server.log.info("Uptime monitoring service initialized successfully");
+-    //     })
+-    //     .catch((error) => {
+-    //       server.log.error("Failed to initialize uptime service:", error);
+-    //       // Continue running without uptime monitoring
+-    //     });
+-    // }
+-  } catch (err) {
+-    server.log.error(err);
+-    process.exit(1);
+-  }
+-};
+-
+-start();
+-
+-// Graceful shutdown
+-let isShuttingDown = false;
+-
+-const shutdown = async (signal: string) => {
+-  if (isShuttingDown) {
+-    server.log.warn(`${signal} received during shutdown, forcing exit...`);
+-    process.exit(1);
+-  }
+-
+-  isShuttingDown = true;
+-  server.log.info(`${signal} received, shutting down gracefully...`);
+-
+-  // Set a timeout to force exit if shutdown takes too long
+-  const forceExitTimeout = setTimeout(() => {
+-    server.log.error("Shutdown timeout exceeded, forcing exit...");
+-    process.exit(1);
+-  }, 10000); // 10 second timeout
+-
+-  try {
+-    // Stop accepting new connections
+-    await server.close();
+-    server.log.info("Server closed");
+-
+-    // Shutdown uptime service
+-    // await uptimeService.shutdown();
+-    // server.log.info("Uptime service shut down");
+-
+-    // Clear the timeout since we're done
+-    clearTimeout(forceExitTimeout);
+-
+-    process.exit(0);
+-  } catch (error) {
+-    server.log.error(error, "Error during shutdown");
+-    clearTimeout(forceExitTimeout);
+-    process.exit(1);
+-  }
+-};
+-
+-process.on("SIGTERM", () => shutdown("SIGTERM"));
+-process.on("SIGINT", () => shutdown("SIGINT"));
+-
++// Project API v1
++server.register(apiV1Routes, { prefix: "/api/v1" });
++// UPTIME MONITORING
++// Only register uptime routes when IS_CLOUD is true (Redis is available)
++// if (IS_CLOUD) {
++//   // Dynamically import uptime modules only when needed
++//   const { getMonitors } = await import("./api/uptime/getMonitors.js");
++//   const { getMonitor } = await import("./api/uptime/getMonitor.js");
++//   const { createMonitor } = await import("./api/uptime/createMonitor.js");
++//   const { updateMonitor } = await import("./api/uptime/updateMonitor.js");
++//   const { deleteMonitor } = await import("./api/uptime/deleteMonitor.js");
++//   const { getMonitorEvents } = await import("./api/uptime/getMonitorEvents.js");
++//   const { getMonitorStats } = await import("./api/uptime/getMonitorStats.js");
++//   const { getMonitorUptimeBuckets } = await import("./api/uptime/getMonitorUptimeBuckets.js");
++//   const { getMonitorStatus } = await import("./api/uptime/getMonitorStatus.js");
++//   const { getMonitorUptime } = await import("./api/uptime/getMonitorUptime.js");
++//   const { getRegions } = await import("./api/uptime/getRegions.js");
++//   const { incidentsRoutes } = await import("./api/uptime/incidents.js");
++//   const { notificationRoutes } = await import("./api/uptime/notifications.js");
++
++//   server.get("/api/uptime/monitors", getMonitors);
++//   server.get("/api/uptime/monitors/:monitorId", getMonitor);
++//   server.post("/api/uptime/monitors", createMonitor);
++//   server.put("/api/uptime/monitors/:monitorId", updateMonitor);
++//   server.delete("/api/uptime/monitors/:monitorId", deleteMonitor);
++//   server.get("/api/uptime/monitors/:monitorId/events", getMonitorEvents);
++//   server.get("/api/uptime/monitors/:monitorId/stats", getMonitorStats);
++//   server.get("/api/uptime/monitors/:monitorId/status", getMonitorStatus);
++//   server.get("/api/uptime/monitors/:monitorId/uptime", getMonitorUptime);
++//   server.get("/api/uptime/monitors/:monitorId/buckets", getMonitorUptimeBuckets);
++//   server.get("/api/uptime/regions", getRegions);
++
++//   // Register incidents routes
++//   server.register(incidentsRoutes);
++
++//   // Register notification routes
++//   server.register(notificationRoutes);
++// }
++
++// STRIPE & ADMIN
++
++if (IS_CLOUD) {
++  // Stripe Routes
++  server.post("/api/stripe/create-checkout-session", createCheckoutSession);
++  server.post("/api/stripe/create-portal-session", createPortalSession);
++  server.post("/api/stripe/preview-subscription-update", previewSubscriptionUpdate);
++  server.post("/api/stripe/update-subscription", updateSubscription);
++  server.get("/api/stripe/subscription", getSubscription);
++  server.post("/api/stripe/webhook", { config: { rawBody: true } }, handleWebhook); // Use rawBody parser config for webhook
++
++  // Admin Routes
++  server.get("/api/admin/sites", getAdminSites);
++  server.get("/api/admin/organizations", getAdminOrganizations);
++  server.post("/api/admin/telemetry", collectTelemetry);
++}
++
++server.post("/track", trackEvent);
++server.post("/api/track", trackEvent);
++
++server.get("/api/health", { logLevel: "silent" }, (_, reply) => reply.send("OK"));
++
++const start = async () => {
++  try {
++    console.info("Starting server...");
++    await Promise.all([initializeClickhouse(), initPostgres()]);
++
++    telemetryService.startTelemetryCron();
++    if (IS_CLOUD) {
++      weeklyReportService.startWeeklyReportCron();
++    }
++
++    // Start the server first
++    await server.listen({ port: 3001, host: "0.0.0.0" });
++    server.log.info("Server is listening on http://0.0.0.0:3001");
++
++    // Test Axiom logging
++    if (hasAxiom) {
++      server.log.info({ axiom: true, dataset: process.env.AXIOM_DATASET }, "Axiom logging is configured");
++    }
++
++    // if (process.env.NODE_ENV === "production") {
++    //   // Initialize uptime monitoring service in the background (non-blocking)
++    //   uptimeService
++    //     .initialize()
++    //     .then(() => {
++    //       server.log.info("Uptime monitoring service initialized successfully");
++    //     })
++    //     .catch((error) => {
++    //       server.log.error("Failed to initialize uptime service:", error);
++    //       // Continue running without uptime monitoring
++    //     });
++    // }
++  } catch (err) {
++    server.log.error(err);
++    process.exit(1);
++  }
++};
++
++start();
++
++// Graceful shutdown
++let isShuttingDown = false;
++
++const shutdown = async (signal: string) => {
++  if (isShuttingDown) {
++    server.log.warn(`${signal} received during shutdown, forcing exit...`);
++    process.exit(1);
++  }
++
++  isShuttingDown = true;
++  server.log.info(`${signal} received, shutting down gracefully...`);
++
++  // Set a timeout to force exit if shutdown takes too long
++  const forceExitTimeout = setTimeout(() => {
++    server.log.error("Shutdown timeout exceeded, forcing exit...");
++    process.exit(1);
++  }, 10000); // 10 second timeout
++
++  try {
++    // Stop accepting new connections
++    await server.close();
++    server.log.info("Server closed");
++
++    // Shutdown uptime service
++    // await uptimeService.shutdown();
++    // server.log.info("Uptime service shut down");
++
++    // Clear the timeout since we're done
++    clearTimeout(forceExitTimeout);
++
++    process.exit(0);
++  } catch (error) {
++    server.log.error(error, "Error during shutdown");
++    clearTimeout(forceExitTimeout);
++    process.exit(1);
++  }
++};
++
++process.on("SIGTERM", () => shutdown("SIGTERM"));
++process.on("SIGINT", () => shutdown("SIGINT"));
++
+ declare module "fastify" {
+   interface FastifyRequest {
+     user?: any; // Or define a more specific user type
++    project?: ProjectRecord;
+   }
+ }
+diff --git a/server/src/lib/projectRateLimiter.test.ts b/server/src/lib/projectRateLimiter.test.ts
+new file mode 100644
+index 0000000..798ad05
+--- /dev/null
++++ b/server/src/lib/projectRateLimiter.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from "vitest";
++import { ProjectRateLimiter } from "./projectRateLimiter.js";
++
++describe("ProjectRateLimiter", () => {
++  it("allows requests within the limit", () => {
++    const limiter = new ProjectRateLimiter(2, 1000);
++    expect(limiter.isAllowed("proj")).toBe(true);
++    expect(limiter.isAllowed("proj")).toBe(true);
++  });
++
++  it("blocks requests when limit exceeded", () => {
++    const limiter = new ProjectRateLimiter(1, 1000);
++    expect(limiter.isAllowed("proj")).toBe(true);
++    expect(limiter.isAllowed("proj")).toBe(false);
++  });
++
++  it("resets after the window passes", async () => {
++    const limiter = new ProjectRateLimiter(1, 10);
++    expect(limiter.isAllowed("proj")).toBe(true);
++    await new Promise(resolve => setTimeout(resolve, 15));
++    limiter.cleanup(Date.now());
++    expect(limiter.isAllowed("proj")).toBe(true);
++  });
++});
+diff --git a/server/src/lib/projectRateLimiter.ts b/server/src/lib/projectRateLimiter.ts
+new file mode 100644
+index 0000000..b23039e
+--- /dev/null
++++ b/server/src/lib/projectRateLimiter.ts
+@@ -0,0 +1,59 @@
++const DEFAULT_MAX_REQUESTS = parseInt(process.env.PROJECT_API_RATE_LIMIT ?? "600", 10);
++const DEFAULT_WINDOW_MS = parseInt(process.env.PROJECT_API_RATE_WINDOW_MS ?? `${60_000}`, 10);
++
++type RateWindow = {
++  count: number;
++  resetTime: number;
++};
++
++export class ProjectRateLimiter {
++  private readonly limits = new Map<string, RateWindow>();
++
++  constructor(
++    private readonly maxRequests: number = DEFAULT_MAX_REQUESTS,
++    private readonly windowMs: number = DEFAULT_WINDOW_MS
++  ) {}
++
++  isAllowed(projectId: string): boolean {
++    if (this.maxRequests <= 0) {
++      return true;
++    }
++
++    const now = Date.now();
++    const existing = this.limits.get(projectId);
++
++    if (!existing || now >= existing.resetTime) {
++      this.limits.set(projectId, {
++        count: 1,
++        resetTime: now + this.windowMs,
++      });
++      return true;
++    }
++
++    if (existing.count >= this.maxRequests) {
++      return false;
++    }
++
++    existing.count += 1;
++    return true;
++  }
++
++  getResetTime(projectId: string): number | null {
++    const entry = this.limits.get(projectId);
++    return entry ? entry.resetTime : null;
++  }
++
++  cleanup(now = Date.now()): void {
++    for (const [key, value] of this.limits.entries()) {
++      if (now >= value.resetTime) {
++        this.limits.delete(key);
++      }
++    }
++  }
++}
++
++export const projectRateLimiter = new ProjectRateLimiter();
++
++setInterval(() => {
++  projectRateLimiter.cleanup();
++}, DEFAULT_WINDOW_MS).unref();
+diff --git a/server/src/services/projects/funnelService.test.ts b/server/src/services/projects/funnelService.test.ts
+new file mode 100644
+index 0000000..30055b8
+--- /dev/null
++++ b/server/src/services/projects/funnelService.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it } from "vitest";
++import { normaliseSteps } from "./funnelService.js";
++
++describe("normaliseSteps", () => {
++  it("reorders steps based on provided order", () => {
++    const steps = normaliseSteps([
++      { key: "third", name: "Third", order: 10 },
++      { key: "first", name: "First", order: 0 },
++      { key: "second", name: "Second", order: 1 },
++    ]);
++
++    expect(steps.map(step => step.key)).toEqual(["first", "second", "third"]);
++    expect(steps.map(step => step.order)).toEqual([0, 1, 2]);
++  });
++
++  it("auto-assigns order when missing", () => {
++    const steps = normaliseSteps([
++      { key: "a", name: "A" },
++      { key: "b", name: "B" },
++    ]);
++
++    expect(steps.map(step => step.order)).toEqual([0, 1]);
++  });
++
++  it("throws on duplicate step keys", () => {
++    expect(() =>
++      normaliseSteps([
++        { key: "a", name: "A" },
++        { key: "a", name: "Duplicate" },
++      ])
++    ).toThrow(/Duplicate step key detected/);
++  });
++});
+diff --git a/server/src/services/projects/funnelService.ts b/server/src/services/projects/funnelService.ts
+new file mode 100644
+index 0000000..6c7ce5b
+--- /dev/null
++++ b/server/src/services/projects/funnelService.ts
+@@ -0,0 +1,370 @@
++import { and, asc, eq, inArray, sql } from "drizzle-orm";
++import { db } from "../../db/postgres/postgres.js";
++import { projectEvents, projectFunnelSteps, projectFunnels } from "../../db/postgres/schema.js";
++import { createServiceLogger } from "../../lib/logger/logger.js";
++
++const logger = createServiceLogger("project-funnels");
++
++export interface FunnelStepInput {
++  key: string;
++  name: string;
++  order?: number;
++  pagePattern?: string;
++}
++
++export interface FunnelInput {
++  name: string;
++  description?: string;
++  isActive?: boolean;
++  steps: FunnelStepInput[];
++}
++
++export interface FunnelRecord {
++  id: string;
++  projectId: string;
++  name: string;
++  description: string | null;
++  isActive: boolean;
++  createdAt: string;
++  updatedAt: string;
++  steps: Array<{
++    id: string;
++    key: string;
++    name: string;
++    order: number;
++    pagePattern: string | null;
++  }>;
++}
++
++export async function listFunnels(projectId: string): Promise<FunnelRecord[]> {
++  const funnels = await db
++    .select()
++    .from(projectFunnels)
++    .where(eq(projectFunnels.projectId, projectId))
++    .orderBy(asc(projectFunnels.createdAt));
++
++  if (!funnels.length) {
++    return [];
++  }
++
++  const funnelIds = funnels.map(f => f.id);
++  const steps = await db
++    .select()
++    .from(projectFunnelSteps)
++    .where(inArray(projectFunnelSteps.funnelId, funnelIds))
++    .orderBy(asc(projectFunnelSteps.stepOrder));
++
++  const stepsByFunnel = steps.reduce<Record<string, FunnelRecord["steps"]>>((acc, step) => {
++    if (!acc[step.funnelId]) {
++      acc[step.funnelId] = [];
++    }
++    acc[step.funnelId].push({
++      id: step.id,
++      key: step.stepKey,
++      name: step.name,
++      order: step.stepOrder,
++      pagePattern: step.pagePattern ?? null,
++    });
++    return acc;
++  }, {});
++
++  return funnels.map(funnel => ({
++    id: funnel.id,
++    projectId: funnel.projectId,
++    name: funnel.name,
++    description: funnel.description ?? null,
++    isActive: funnel.isActive,
++    createdAt: funnel.createdAt,
++    updatedAt: funnel.updatedAt,
++    steps: stepsByFunnel[funnel.id] ?? [],
++  }));
++}
++
++export async function getFunnel(projectId: string, funnelId: string): Promise<FunnelRecord | null> {
++  const funnel = await db
++    .select()
++    .from(projectFunnels)
++    .where(and(eq(projectFunnels.id, funnelId), eq(projectFunnels.projectId, projectId)))
++    .limit(1);
++
++  if (!funnel[0]) {
++    return null;
++  }
++
++  const steps = await db
++    .select()
++    .from(projectFunnelSteps)
++    .where(eq(projectFunnelSteps.funnelId, funnelId))
++    .orderBy(asc(projectFunnelSteps.stepOrder));
++
++  return {
++    id: funnel[0].id,
++    projectId: funnel[0].projectId,
++    name: funnel[0].name,
++    description: funnel[0].description ?? null,
++    isActive: funnel[0].isActive,
++    createdAt: funnel[0].createdAt,
++    updatedAt: funnel[0].updatedAt,
++    steps: steps.map(step => ({
++      id: step.id,
++      key: step.stepKey,
++      name: step.name,
++      order: step.stepOrder,
++      pagePattern: step.pagePattern ?? null,
++    })),
++  };
++}
++
++type NormalisedFunnelStep = FunnelStepInput & { order: number };
++
++export async function createFunnel(projectId: string, input: FunnelInput): Promise<FunnelRecord> {
++  const steps = input.steps ?? [];
++
++  if (!steps.length) {
++    throw new Error("A funnel requires at least one step");
++  }
++
++  return db.transaction(async tx => {
++    const [funnel] = await tx
++      .insert(projectFunnels)
++      .values({
++        projectId,
++        name: input.name,
++        description: input.description,
++        isActive: input.isActive ?? true,
++      })
++      .returning();
++
++    const orderedSteps = normaliseSteps(steps);
++
++    const insertedSteps = await tx
++      .insert(projectFunnelSteps)
++      .values(
++        orderedSteps.map(step => ({
++          funnelId: funnel.id,
++          stepOrder: step.order,
++          stepKey: step.key,
++          name: step.name,
++          pagePattern: step.pagePattern,
++        }))
++      )
++      .returning();
++
++    return {
++      id: funnel.id,
++      projectId: funnel.projectId,
++      name: funnel.name,
++      description: funnel.description ?? null,
++      isActive: funnel.isActive,
++      createdAt: funnel.createdAt,
++      updatedAt: funnel.updatedAt,
++      steps: insertedSteps.map(step => ({
++        id: step.id,
++        key: step.stepKey,
++        name: step.name,
++        order: step.stepOrder,
++        pagePattern: step.pagePattern ?? null,
++      })),
++    };
++  });
++}
++
++export async function updateFunnel(projectId: string, funnelId: string, input: Partial<FunnelInput>) {
++  return db.transaction(async tx => {
++    const [existing] = await tx
++      .select()
++      .from(projectFunnels)
++      .where(and(eq(projectFunnels.id, funnelId), eq(projectFunnels.projectId, projectId)))
++      .limit(1);
++
++    if (!existing) {
++      return null;
++    }
++
++    let updatedAt = existing.updatedAt;
++
++    if (input.name || input.description || input.isActive !== undefined) {
++      updatedAt = new Date().toISOString();
++      await tx
++        .update(projectFunnels)
++        .set({
++          name: input.name ?? existing.name,
++          description: input.description ?? existing.description,
++          isActive: input.isActive ?? existing.isActive,
++          updatedAt,
++        })
++        .where(eq(projectFunnels.id, funnelId));
++    }
++
++    let steps = await tx
++      .select()
++      .from(projectFunnelSteps)
++      .where(eq(projectFunnelSteps.funnelId, funnelId))
++      .orderBy(asc(projectFunnelSteps.stepOrder));
++
++    if (input.steps) {
++      await tx.delete(projectFunnelSteps).where(eq(projectFunnelSteps.funnelId, funnelId));
++      const orderedSteps = normaliseSteps(input.steps);
++      steps = await tx
++        .insert(projectFunnelSteps)
++        .values(
++          orderedSteps.map(step => ({
++            funnelId,
++            stepOrder: step.order,
++            stepKey: step.key,
++            name: step.name,
++            pagePattern: step.pagePattern,
++          }))
++        )
++        .returning();
++    }
++
++    return {
++      id: existing.id,
++      projectId: existing.projectId,
++      name: input.name ?? existing.name,
++      description: input.description ?? existing.description ?? null,
++      isActive: input.isActive ?? existing.isActive,
++      createdAt: existing.createdAt,
++      updatedAt,
++      steps: steps.map(step => ({
++        id: step.id,
++        key: step.stepKey,
++        name: step.name,
++        order: step.stepOrder,
++        pagePattern: step.pagePattern ?? null,
++      })),
++    };
++  });
++}
++
++export async function deleteFunnel(projectId: string, funnelId: string): Promise<boolean> {
++  const deleted = await db
++    .delete(projectFunnels)
++    .where(and(eq(projectFunnels.id, funnelId), eq(projectFunnels.projectId, projectId)))
++    .returning({ id: projectFunnels.id });
++  return deleted.length > 0;
++}
++
++export interface FunnelStatsRequest {
++  from?: string;
++  to?: string;
++}
++
++export interface FunnelStepStats {
++  stepKey: string;
++  name: string;
++  visits: number;
++  conversions: number;
++  dropOff: number;
++  conversionRate: number;
++  order: number;
++}
++
++export interface FunnelStats {
++  funnelId: string;
++  totalVisitors: number;
++  steps: FunnelStepStats[];
++}
++
++export async function getFunnelStats(
++  projectId: string,
++  funnelId: string,
++  params: FunnelStatsRequest
++): Promise<FunnelStats | null> {
++  const funnel = await getFunnel(projectId, funnelId);
++
++  if (!funnel) {
++    return null;
++  }
++
++  if (!funnel.steps.length) {
++    return {
++      funnelId,
++      totalVisitors: 0,
++      steps: [],
++    };
++  }
++
++  const filters = [eq(projectEvents.projectId, projectId), eq(projectEvents.funnelId, funnelId)];
++
++  if (params.from) {
++    filters.push(sql`${projectEvents.occurredAt} >= ${params.from}`);
++  }
++
++  if (params.to) {
++    filters.push(sql`${projectEvents.occurredAt} <= ${params.to}`);
++  }
++
++  const stats = await db
++    .select({
++      stepKey: projectEvents.stepKey,
++      visitors: sql<number>`COUNT(DISTINCT COALESCE(${projectEvents.sessionHash}, ${projectEvents.userHash}, ${projectEvents.id}))`,
++    })
++    .from(projectEvents)
++    .where(and(...filters))
++    .groupBy(projectEvents.stepKey);
++
++  const visitorsByStep = new Map<string, number>();
++  stats.forEach(row => {
++    if (row.stepKey) {
++      visitorsByStep.set(row.stepKey, Number(row.visitors ?? 0));
++    }
++  });
++
++  let previousVisitors = funnel.steps.length ? visitorsByStep.get(funnel.steps[0].key) ?? 0 : 0;
++  let totalVisitors = previousVisitors;
++
++  const stepStats = funnel.steps.map((step, index) => {
++    const visits = visitorsByStep.get(step.key) ?? 0;
++    if (index === 0) {
++      previousVisitors = visits;
++      totalVisitors = visits;
++    }
++    const nextVisitors = index === funnel.steps.length - 1 ? visits : visitorsByStep.get(funnel.steps[index + 1].key) ?? 0;
++    const conversions = nextVisitors;
++    const dropOff = Math.max(visits - conversions, 0);
++    const conversionRate = visits > 0 ? Number(((conversions / visits) * 100).toFixed(2)) : 0;
++    return {
++      stepKey: step.key,
++      name: step.name,
++      visits,
++      conversions,
++      dropOff,
++      conversionRate,
++      order: step.order,
++    };
++  });
++
++  return {
++    funnelId,
++    totalVisitors,
++    steps: stepStats,
++  };
++}
++
++export function normaliseSteps(steps: FunnelStepInput[]): NormalisedFunnelStep[] {
++  const seenKeys = new Set<string>();
++
++  const ordered = steps
++    .map((step, index) => ({
++      key: step.key,
++      name: step.name,
++      order: step.order ?? index,
++      pagePattern: step.pagePattern,
++    }))
++    .sort((a, b) => a.order - b.order)
++    .map((step, index) => ({
++      ...step,
++      order: index,
++    }));
++
++  for (const step of ordered) {
++    if (seenKeys.has(step.key)) {
++      throw new Error(`Duplicate step key detected: ${step.key}`);
++    }
++    seenKeys.add(step.key);
++  }
++
++  return ordered;
++}
+diff --git a/server/src/services/projects/projectService.test.ts b/server/src/services/projects/projectService.test.ts
+new file mode 100644
+index 0000000..9544a66
+--- /dev/null
++++ b/server/src/services/projects/projectService.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { generateProjectApiKey, hashIdentifier, hashSecret } from "./projectService.js";
++
++describe("projectService hashing", () => {
++  it("hashSecret returns deterministic sha256 hashes", () => {
++    const value = "secret-value";
++    const hash1 = hashSecret(value);
++    const hash2 = hashSecret(value);
++    expect(hash1).toBe(hash2);
++    expect(hash1).toMatch(/^[a-f0-9]{64}$/);
++  });
++
++  it("hashIdentifier returns null for empty values", () => {
++    expect(hashIdentifier(null)).toBeNull();
++    expect(hashIdentifier(undefined)).toBeNull();
++    expect(hashIdentifier("")).toBeNull();
++  });
++
++  it("hashIdentifier hashes non-empty identifiers", () => {
++    const hashed = hashIdentifier("user-123");
++    expect(hashed).toMatch(/^[a-f0-9]{64}$/);
++  });
++});
++
++describe("generateProjectApiKey", () => {
++  it("generates a key with rbp_ prefix", () => {
++    const { apiKey, apiKeyHash } = generateProjectApiKey();
++    expect(apiKey.startsWith("rbp_")).toBe(true);
++    expect(apiKey.length).toBe(52);
++    expect(apiKeyHash).toMatch(/^[a-f0-9]{64}$/);
++  });
++});
+diff --git a/server/src/services/projects/projectService.ts b/server/src/services/projects/projectService.ts
+new file mode 100644
+index 0000000..7350e93
+--- /dev/null
++++ b/server/src/services/projects/projectService.ts
+@@ -0,0 +1,134 @@
++import crypto from "crypto";
++import NodeCache from "node-cache";
++import { and, eq } from "drizzle-orm";
++import { db } from "../../db/postgres/postgres.js";
++import { projects } from "../../db/postgres/schema.js";
++import { createServiceLogger } from "../../lib/logger/logger.js";
++
++const logger = createServiceLogger("projects-service");
++
++const apiKeyCache = new NodeCache({
++  stdTTL: 60,
++  checkperiod: 120,
++  useClones: false,
++});
++
++export interface ProjectRecord {
++  id: string;
++  organizationId: string;
++  name: string;
++  apiKeyHash: string;
++  createdAt: string;
++  updatedAt: string;
++  metadata: Record<string, unknown>;
++  isActive: boolean;
++}
++
++const API_KEY_PREFIX = "rbp_";
++const API_KEY_LENGTH = 48;
++
++export function generateProjectApiKey(): { apiKey: string; apiKeyHash: string } {
++  const rawKey = crypto.randomBytes(API_KEY_LENGTH / 2).toString("hex"); // 48 chars hex
++  const apiKey = `${API_KEY_PREFIX}${rawKey}`;
++  return { apiKey, apiKeyHash: hashSecret(apiKey) };
++}
++
++export function hashSecret(value: string): string {
++  return crypto.createHash("sha256").update(value).digest("hex");
++}
++
++export function hashIdentifier(value: string | null | undefined): string | null {
++  if (!value) {
++    return null;
++  }
++  return hashSecret(value);
++}
++
++export async function getProjectById(projectId: string): Promise<ProjectRecord | null> {
++  const records = await db
++    .select()
++    .from(projects)
++    .where(eq(projects.id, projectId))
++    .limit(1);
++
++  return records[0] ? mapProjectRecord(records[0]) : null;
++}
++
++export async function getProjectByApiKey(apiKey: string): Promise<ProjectRecord | null> {
++  if (!apiKey.startsWith(API_KEY_PREFIX)) {
++    logger.warn({ apiKeyPrefix: apiKey.slice(0, 5) }, "Invalid API key prefix");
++    return null;
++  }
++
++  const cacheHit = apiKeyCache.get<ProjectRecord>(apiKey);
++  if (cacheHit) {
++    return cacheHit;
++  }
++
++  const apiKeyHash = hashSecret(apiKey);
++
++  try {
++    const [project] = await db
++      .select()
++      .from(projects)
++      .where(and(eq(projects.apiKeyHash, apiKeyHash), eq(projects.isActive, true)))
++      .limit(1);
++
++    if (!project) {
++      return null;
++    }
++
++    const formatted = mapProjectRecord(project);
++
++    apiKeyCache.set(apiKey, formatted);
++    return formatted;
++  } catch (error) {
++    logger.error(error, "Failed to fetch project by API key");
++    return null;
++  }
++}
++
++export async function createProject(params: {
++  organizationId: string;
++  name: string;
++  metadata?: Record<string, unknown>;
++}): Promise<{ project: ProjectRecord; apiKey: string }> {
++  const { apiKey, apiKeyHash } = generateProjectApiKey();
++
++  const [record] = await db
++    .insert(projects)
++    .values({
++      organizationId: params.organizationId,
++      name: params.name,
++      apiKeyHash,
++      metadata: params.metadata ?? {},
++    })
++    .returning();
++
++  const project = mapProjectRecord(record);
++
++  return { project, apiKey };
++}
++
++export async function deactivateProject(projectId: string): Promise<void> {
++  await db.update(projects).set({ isActive: false }).where(eq(projects.id, projectId));
++}
++
++export async function rotateProjectApiKey(projectId: string): Promise<{ apiKey: string }> {
++  const { apiKey, apiKeyHash } = generateProjectApiKey();
++  await db.update(projects).set({ apiKeyHash }).where(eq(projects.id, projectId));
++  return { apiKey };
++}
++
++function mapProjectRecord(record: typeof projects.$inferSelect): ProjectRecord {
++  return {
++    id: record.id,
++    organizationId: record.organizationId,
++    name: record.name,
++    apiKeyHash: record.apiKeyHash,
++    createdAt: record.createdAt,
++    updatedAt: record.updatedAt,
++    metadata: (record.metadata ?? {}) as Record<string, unknown>,
++    isActive: record.isActive,
++  };
++}

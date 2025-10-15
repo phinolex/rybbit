@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import NodeCache from "node-cache";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/postgres/postgres.js";
 import { projects } from "../../db/postgres/schema.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
@@ -112,6 +112,42 @@ export async function createProject(params: {
 
 export async function deactivateProject(projectId: string): Promise<void> {
   await db.update(projects).set({ isActive: false }).where(eq(projects.id, projectId));
+}
+
+/**
+ * Get or create a Project linked to a Site (for API v1 usage with rb_* keys)
+ */
+export async function getOrCreateProjectForSite(siteId: number, organizationId: string): Promise<ProjectRecord> {
+  // Look for existing project linked to this site
+  const existing = await db
+    .select()
+    .from(projects)
+    .where(
+      and(
+        eq(projects.organizationId, organizationId),
+        sql`${projects.metadata}->>'siteId' = ${String(siteId)}`
+      )
+    )
+    .limit(1);
+
+  if (existing.length > 0) {
+    return mapProjectRecord(existing[0]);
+  }
+
+  // Create a new project for this site
+  const { apiKey, apiKeyHash } = generateProjectApiKey();
+
+  const [record] = await db
+    .insert(projects)
+    .values({
+      organizationId,
+      name: `Site ${siteId} API v1`,
+      apiKeyHash,
+      metadata: { siteId, apiKey },  // Store the API key in metadata for reference
+    })
+    .returning();
+
+  return mapProjectRecord(record);
 }
 
 export async function rotateProjectApiKey(projectId: string): Promise<{ apiKey: string }> {

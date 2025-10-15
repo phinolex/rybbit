@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 interface SiteConfigData {
   id: string;
   siteId: number;
+  organizationId: string | null;
   domain: string;
   apiKey?: string | null;
   public: boolean;
@@ -90,6 +91,7 @@ describe("validateApiKey", () => {
     const mockSite: SiteConfigData = {
       id: "test-id",
       siteId: 1,
+      organizationId: "test-org-id",
       apiKey: "valid-api-key",
       domain: "example.com",
       public: true,
@@ -118,6 +120,7 @@ describe("validateApiKey", () => {
     const mockSite: SiteConfigData = {
       id: "test-id",
       siteId: 1,
+      organizationId: "test-org-id",
       apiKey: "valid-api-key",
       domain: "example.com",
       public: true,
@@ -145,6 +148,7 @@ describe("validateApiKey", () => {
     const mockSite: SiteConfigData = {
       id: "test-id",
       siteId: 123,
+      organizationId: "test-org-id",
       apiKey: "test-key",
       domain: "example.com",
       public: true,
@@ -174,6 +178,7 @@ describe("validateApiKey", () => {
         SiteConfigData,
         | "id"
         | "siteId"
+        | "organizationId"
         | "domain"
         | "public"
         | "saltUserIds"
@@ -189,6 +194,7 @@ describe("validateApiKey", () => {
       > = {
       id: "test-id",
       siteId: 1,
+      organizationId: "test-org-id",
       domain: "example.com",
       public: true,
       saltUserIds: false,

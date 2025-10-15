@@ -114,6 +114,7 @@ services:
       # Axiom logging configuration (optional)
       - AXIOM_DATASET=${AXIOM_DATASET}
       - AXIOM_TOKEN=${AXIOM_TOKEN}
+      - MAPBOX_TOKEN=${MAPBOX_TOKEN}
     depends_on:
       clickhouse:
         condition: service_healthy

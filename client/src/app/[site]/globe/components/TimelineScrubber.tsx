@@ -1,29 +1,26 @@
 import { debounce } from "lodash";
 import { AlertTriangle, Pause, Play } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../../../components/ui/select";
 import { TimelineSlider } from "../../../../components/ui/timeline-slider";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../../../../components/ui/tooltip";
-import { useTimelineSessions } from "../hooks/useTimelineSessions";
-import { useTimelineStore } from "../timelineStore";
-import { formatTimelineTime, generateTimeWindows, getActiveSessions, WINDOW_SIZE_OPTIONS } from "../timelineUtils";
+import { useTimelineStore, useActiveSessions } from "../timelineStore";
+import { formatTimelineTime, generateTimeWindows, getSessionCountsPerWindow } from "../timelineUtils";
+import { MAX_PAGES, PAGE_SIZE } from "../hooks/timelineLayer/timelineLayerConstants";
 
 export function TimelineScrubber() {
-  const { currentTime, timeRange, windowSize, setCurrentTime, setManualWindowSize } = useTimelineStore();
-  const { activeSessions, allSessions, isLoading, hasMoreData } = useTimelineSessions();
+  const { currentTime, timeRange, windowSize, setCurrentTime, allSessions, isLoading, hasMoreData } =
+    useTimelineStore();
+  const activeSessions = useActiveSessions();
   const [isPlaying, setIsPlaying] = useState(false);
   const [localSliderIndex, setLocalSliderIndex] = useState(0);
-
-  // Handle window size change
-  const handleWindowSizeChange = (value: string) => {
-    const newSize = parseInt(value, 10);
-    setManualWindowSize(newSize);
-  };
+  const [displayedCounts, setDisplayedCounts] = useState<number[]>([]);
+  const [isCalculating, setIsCalculating] = useState(false);
 
   // Generate time windows for the slider
   const timeWindows = useMemo(() => {
     if (!timeRange) return [];
-    return generateTimeWindows(timeRange.start, timeRange.end, windowSize);
+    const timeWindows = generateTimeWindows(timeRange.start, timeRange.end, windowSize);
+    return timeWindows;
   }, [timeRange, windowSize]);
 
   // Get current window index from store
@@ -93,20 +90,52 @@ export function TimelineScrubber() {
     return timeWindows[localSliderIndex] || currentTime;
   }, [timeWindows, localSliderIndex, currentTime]);
 
-  // Calculate session counts per time window for histogram
-  const sessionCounts = useMemo(() => {
-    if (timeWindows.length === 0 || allSessions.length === 0) return [];
+  // Debounced function to calculate session counts
+  const debouncedCalculateCounts = useRef(
+    debounce((windows: ReturnType<typeof generateTimeWindows>, sessions: typeof allSessions, size: number) => {
+      if (windows.length === 0 || sessions.length === 0) {
+        setDisplayedCounts([]);
+        setIsCalculating(false);
+        return;
+      }
+      const counts = getSessionCountsPerWindow(sessions, windows, size);
+      setDisplayedCounts(counts);
+      setIsCalculating(false);
+    }, 200)
+  ).current;
 
-    return timeWindows.map(windowStart => {
-      const sessionsInWindow = getActiveSessions(allSessions, windowStart, windowSize);
-      return sessionsInWindow.length;
-    });
-  }, [timeWindows, allSessions, windowSize]);
+  // Cleanup debounce on unmount
+  useEffect(() => {
+    return () => {
+      debouncedCalculateCounts.cancel();
+    };
+  }, [debouncedCalculateCounts]);
+
+  // Reset to start time when window size changes
+  const prevWindowSizeRef = useRef(windowSize);
+  useEffect(() => {
+    if (prevWindowSizeRef.current !== windowSize && timeWindows.length > 0) {
+      setCurrentTime(timeWindows[0]);
+      setLocalSliderIndex(0);
+    }
+    prevWindowSizeRef.current = windowSize;
+  }, [windowSize, timeWindows, setCurrentTime]);
+
+  // Trigger calculation when dependencies change
+  useEffect(() => {
+    if (timeWindows.length > 0 && allSessions.length > 0) {
+      setIsCalculating(true);
+      debouncedCalculateCounts(timeWindows, allSessions, windowSize);
+    } else {
+      setDisplayedCounts([]);
+      setIsCalculating(false);
+    }
+  }, [timeWindows, allSessions, windowSize, debouncedCalculateCounts]);
 
   // Get max count for scaling the histogram
   const maxCount = useMemo(() => {
-    return sessionCounts.length > 0 ? Math.max(...sessionCounts, 1) : 1;
-  }, [sessionCounts]);
+    return displayedCounts.length > 0 ? Math.max(...displayedCounts, 1) : 1;
+  }, [displayedCounts]);
 
   if (isLoading) {
     return (
@@ -124,8 +153,13 @@ export function TimelineScrubber() {
   return (
     <div className="w-full flex flex-col">
       {/* Session histogram */}
-      <div className="w-full h-8 flex items-end gap-[1px]">
-        {sessionCounts.map((count, index) => {
+      <div className="w-full h-8 flex items-end gap-[1px] relative">
+        {isCalculating && displayedCounts.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="w-3 h-3 border-2 border-neutral-600 border-t-accent-500 rounded-full animate-spin" />
+          </div>
+        )}
+        {displayedCounts.map((count, index) => {
           const heightPercentage = (count / maxCount) * 100;
           const isActive = index === localSliderIndex;
 
@@ -137,6 +171,7 @@ export function TimelineScrubber() {
                 height: `${heightPercentage}%`,
                 backgroundColor: isActive ? "hsl(var(--accent-600))" : "rgba(115, 115, 115, 0.4)",
                 minHeight: count > 0 ? "2px" : "0px",
+                opacity: isCalculating ? 0.5 : 1,
               }}
               title={`${count} session${count !== 1 ? "s" : ""}`}
               onClick={() => {
@@ -151,7 +186,7 @@ export function TimelineScrubber() {
       </div>
       <TimelineSlider value={[localSliderIndex]} max={timeWindows.length - 1} onValueChange={handleSliderChange} />
 
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between mt-1">
         <div className="flex items-center gap-1 w-full">
           <button
             onClick={() => setIsPlaying(!isPlaying)}
@@ -165,21 +200,9 @@ export function TimelineScrubber() {
           </span>
         </div>
         <div className="flex items-center gap-3">
-          <Select value={windowSize.toString()} onValueChange={handleWindowSizeChange}>
-            <SelectTrigger className="w-[100px] h-8 text-xs" size="sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {WINDOW_SIZE_OPTIONS.map(option => (
-                <SelectItem key={option.value} value={option.value.toString()}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
           <div className="text-xs text-neutral-400 flex items-center gap-1 whitespace-nowrap">
             <span className="font-bold text-accent-400">
-              {activeSessions.length} / {allSessions.length}
+              {activeSessions.length.toLocaleString()} / {allSessions.length.toLocaleString()}
             </span>{" "}
             sessions
             {hasMoreData && (
@@ -189,7 +212,10 @@ export function TimelineScrubber() {
                     <AlertTriangle className="w-3.5 h-3.5 text-yellow-500 ml-1" />
                   </TooltipTrigger>
                   <TooltipContent>
-                    <p>Showing only the first 50,000 sessions. More data may be available.</p>
+                    <p>
+                      Showing only the first {(MAX_PAGES * PAGE_SIZE).toLocaleString()} sessions. More data may be
+                      available.
+                    </p>
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>

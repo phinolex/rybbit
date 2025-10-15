@@ -1,16 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { DateTime } from "luxon";
 import { useEffect, useMemo } from "react";
-import { GetSessionsResponse } from "../../../../api/analytics/userSessions";
-import { APIResponse } from "../../../../api/types";
-import { authedFetch, getQueryParams } from "../../../../api/utils";
-import { getFilteredFilters, SESSION_PAGE_FILTERS, useStore } from "../../../../lib/store";
-import { useTimelineStore } from "../timelineStore";
-import { calculateWindowSize, getActiveSessions } from "../timelineUtils";
+import { GetSessionsResponse } from "../../../../../api/analytics/userSessions";
+import { APIResponse } from "../../../../../api/types";
+import { authedFetch, getQueryParams } from "../../../../../api/utils";
+import { getFilteredFilters, SESSION_PAGE_FILTERS, useStore } from "../../../../../lib/store";
+import { useTimelineStore } from "../../timelineStore";
+import { calculateWindowSize } from "../../timelineUtils";
+import { MAX_PAGES, PAGE_SIZE } from "./timelineLayerConstants";
 
 export function useTimelineSessions() {
   const { time, site } = useStore();
-  const { currentTime, windowSize, manualWindowSize, setTimeRange, setWindowSize } = useTimelineStore();
+  const { manualWindowSize, setTimeRange, setWindowSize, setAllSessions, setLoading, setError } = useTimelineStore();
 
   const filteredFilters = getFilteredFilters(SESSION_PAGE_FILTERS);
 
@@ -19,16 +20,14 @@ export function useTimelineSessions() {
     queryKey: ["timeline-sessions", time, site, filteredFilters],
     queryFn: async () => {
       const allSessions = [];
-      const maxPages = 5;
-      const limit = 10000;
       let reachedMaxPages = false;
 
-      for (let page = 1; page <= maxPages; page++) {
+      for (let page = 1; page <= MAX_PAGES; page++) {
         const requestParams = {
           ...getQueryParams(time),
           filters: filteredFilters,
           page,
-          limit,
+          limit: PAGE_SIZE,
         };
 
         const response = await authedFetch<APIResponse<GetSessionsResponse>>(`/sessions/${site}`, requestParams);
@@ -37,12 +36,12 @@ export function useTimelineSessions() {
           allSessions.push(...response.data);
 
           // If we got fewer results than the limit, we've reached the end
-          if (response.data.length < limit) {
+          if (response.data.length < PAGE_SIZE) {
             break;
           }
 
           // If we're on the last page and got a full page, there might be more
-          if (page === maxPages && response.data.length === limit) {
+          if (page === MAX_PAGES && response.data.length === PAGE_SIZE) {
             reachedMaxPages = true;
           }
         } else {
@@ -63,6 +62,22 @@ export function useTimelineSessions() {
     if (!data?.data) return [];
     return data.data;
   }, [data]);
+
+  // Update store with loading/error state
+  useEffect(() => {
+    setLoading(isLoading);
+  }, [isLoading, setLoading]);
+
+  useEffect(() => {
+    setError(isError);
+  }, [isError, setError]);
+
+  // Update store with allSessions
+  useEffect(() => {
+    if (allSessions.length > 0) {
+      setAllSessions(allSessions, data?.hasMoreData || false);
+    }
+  }, [allSessions, data?.hasMoreData, setAllSessions]);
 
   // Calculate time range from fetched sessions and initialize timeline
   useEffect(() => {
@@ -93,18 +108,4 @@ export function useTimelineSessions() {
       setTimeRange(earliest, latest);
     }
   }, [allSessions, setTimeRange, setWindowSize, manualWindowSize, time]);
-
-  // Filter sessions based on current time window
-  const activeSessions = useMemo(() => {
-    if (!currentTime || !allSessions.length) return [];
-    return getActiveSessions(allSessions, currentTime, windowSize);
-  }, [allSessions, currentTime, windowSize]);
-
-  return {
-    allSessions,
-    activeSessions,
-    isLoading,
-    isError,
-    hasMoreData: data?.hasMoreData || false,
-  };
 }

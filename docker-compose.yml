@@ -94,6 +94,7 @@ services:
       - BASE_URL=${BASE_URL}
       - DISABLE_SIGNUP=${DISABLE_SIGNUP}
       - DISABLE_TELEMETRY=${DISABLE_TELEMETRY}
+      - MAPBOX_TOKEN=${MAPBOX_TOKEN}
       # # Redis configuration
       # - REDIS_HOST=redis
       # - REDIS_PORT=6379

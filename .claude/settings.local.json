@@ -43,7 +43,8 @@
       "WebFetch(domain:rybbit.io)",
       "WebFetch(domain:docs.mapbox.com)",
       "WebFetch(domain:www.onyx.app)",
-      "WebFetch(domain:docs.onyx.app)"
+      "WebFetch(domain:docs.onyx.app)",
+      "Bash(awk:*)"
     ]
   },
   "enableAllProjectMcpServers": false

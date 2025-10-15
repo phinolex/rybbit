@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
+import { useConfigs } from "../../../../lib/configs";
 
 export function useMapbox(containerRef: React.RefObject<HTMLDivElement | null>) {
   const map = useRef<mapboxgl.Map | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
 
+  const { configs } = useConfigs();
+
   useEffect(() => {
-    if (!containerRef.current || !process.env.NEXT_PUBLIC_MAPBOX_TOKEN) {
+    if (!containerRef.current || !configs?.mapboxToken) {
       return;
     }
 
-    mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN || "";
+    mapboxgl.accessToken = configs.mapboxToken;
 
     map.current = new mapboxgl.Map({
       container: containerRef.current,
@@ -49,7 +52,7 @@ export function useMapbox(containerRef: React.RefObject<HTMLDivElement | null>) 
       map.current?.remove();
       map.current = null;
     };
-  }, [containerRef]);
+  }, [containerRef, configs?.mapboxToken]);
 
   return { map, mapLoaded };
 }

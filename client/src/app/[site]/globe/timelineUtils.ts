@@ -84,6 +84,76 @@ export function getActiveSessions(
 }
 
 /**
+ * Optimized function to count sessions per time window
+ * Uses sweep-line algorithm with binary search for O(W log N) complexity
+ */
+export function getSessionCountsPerWindow(
+  sessions: GetSessionsResponse,
+  timeWindows: DateTime[],
+  windowSize: number
+): number[] {
+  // Parse all session times once upfront and convert to epoch ms
+  const startTimes: number[] = [];
+  const endTimes: number[] = [];
+
+  for (const session of sessions) {
+    const start = DateTime.fromSQL(session.session_start, { zone: "utc" }).toLocal();
+    const end = DateTime.fromSQL(session.session_end, { zone: "utc" }).toLocal();
+    startTimes.push(start.toMillis());
+    endTimes.push(end.toMillis());
+  }
+
+  // Sort both arrays independently
+  startTimes.sort((a, b) => a - b);
+  endTimes.sort((a, b) => a - b);
+
+  // Binary search to find first index where value >= target
+  const findFirstGTE = (arr: number[], target: number): number => {
+    let left = 0;
+    let right = arr.length;
+
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (arr[mid] < target) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    return left;
+  };
+
+  // Binary search to find first index where value > target
+  const findFirstGT = (arr: number[], target: number): number => {
+    let left = 0;
+    let right = arr.length;
+
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (arr[mid] <= target) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    return left;
+  };
+
+  // Count sessions for each window using sweep-line
+  return timeWindows.map(windowStart => {
+    const windowEnd = windowStart.plus({ minutes: windowSize });
+    const windowStartMs = windowStart.toMillis();
+    const windowEndMs = windowEnd.toMillis();
+
+    // Count = (sessions that started before window end) - (sessions that ended at or before window start)
+    const startsBeforeEnd = findFirstGTE(startTimes, windowEndMs);
+    const endsBeforeOrAtStart = findFirstGT(endTimes, windowStartMs);
+
+    return startsBeforeEnd - endsBeforeOrAtStart;
+  });
+}
+
+/**
  * Format time for display in the timeline
  */
 export function formatTimelineTime(time: DateTime, windowSize: number): string {

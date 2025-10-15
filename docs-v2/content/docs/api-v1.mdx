@@ -1,3 +1,8 @@
+---
+title: REST API v1
+description: Programmatic analytics access for server-side tracking, mobile apps, and integrations
+---
+
 # Rybbit API v1 Guide
 
 Straightforward overview of the REST API living at `/api/v1`. Every call must include your **Site API key** in `X-API-Key`.
@@ -86,7 +91,7 @@ Essential routes:
 
 - `GET /api/v1/funnels` — list funnels.
 - `GET /api/v1/funnels/{id}` — fetch a funnel with steps.
-- `PATCH /api/v1/funnels/{id}` — rename, toggle, or replace steps.
+- `PATCH /api/v1/funnels/{id}` — rename, toggle, or steps.
 - `DELETE /api/v1/funnels/{id}` — drop a funnel.
 - `GET /api/v1/funnels/{id}/stats?from=&to=` — per-step visitors, conversions, drop-off, conversion rate.
 

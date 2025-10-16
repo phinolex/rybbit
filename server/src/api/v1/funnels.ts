@@ -33,6 +33,7 @@ const stepSchema = z.preprocess(
     name: z.string().min(1).max(128),
     order: z.number().int().nonnegative().optional(),
     page_pattern: z.string().max(2048).optional(),
+    pagePattern: z.string().max(2048).optional(), // Accept but will be normalized by preprocess
   })
 );
 

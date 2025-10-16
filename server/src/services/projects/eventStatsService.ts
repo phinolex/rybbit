@@ -1,16 +1,14 @@
-import { SQL, and, eq, gte, lte, sql } from "drizzle-orm";
+import { SQL, and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/postgres/postgres.js";
 import { projectEvents, projectOverviewDaily } from "../../db/postgres/schema.js";
+import { buildDateRangeFilters, normalizeDateToYYYYMMDD } from "../../api/v1/utils/index.js";
 
 export interface EventStatsParams {
   from?: string;
   to?: string;
 }
 
-interface DateRange {
-  fromDate?: string;
-  toDate?: string;
-}
+// Moved to utils/dates.ts
 
 export interface EventSummary {
   totalEvents: number;
@@ -50,15 +48,13 @@ export interface EventDailyPoint {
 }
 
 export async function getEventDailySeries(projectId: string, params: EventStatsParams): Promise<EventDailyPoint[]> {
-  const { fromDate, toDate } = normaliseDateRange(params);
+  const fromDate = normalizeDateToYYYYMMDD(params.from);
+  const toDate = normalizeDateToYYYYMMDD(params.to);
 
-  const filters: SQL<unknown>[] = [eq(projectOverviewDaily.projectId, projectId)];
-  if (fromDate) {
-    filters.push(gte(projectOverviewDaily.eventDate, fromDate));
-  }
-  if (toDate) {
-    filters.push(lte(projectOverviewDaily.eventDate, toDate));
-  }
+  const filters: SQL<unknown>[] = [
+    eq(projectOverviewDaily.projectId, projectId),
+    ...buildDateRangeFilters(projectOverviewDaily.eventDate, fromDate, toDate),
+  ];
 
   const rows = await db
     .select({
@@ -78,35 +74,10 @@ export async function getEventDailySeries(projectId: string, params: EventStatsP
 }
 
 function buildEventFilters(projectId: string, params: EventStatsParams): SQL<unknown>[] {
-  const filters: SQL<unknown>[] = [eq(projectEvents.projectId, projectId)];
-
-  if (params.from) {
-    filters.push(gte(projectEvents.occurredAt, params.from));
-  }
-
-  if (params.to) {
-    filters.push(lte(projectEvents.occurredAt, params.to));
-  }
-
-  return filters;
+  return [
+    eq(projectEvents.projectId, projectId),
+    ...buildDateRangeFilters(projectEvents.occurredAt, params.from, params.to),
+  ];
 }
 
-function normaliseDateRange(params: EventStatsParams): DateRange {
-  const range: DateRange = {};
-
-  if (params.from) {
-    const fromDate = new Date(params.from);
-    if (!Number.isNaN(fromDate.getTime())) {
-      range.fromDate = fromDate.toISOString().slice(0, 10);
-    }
-  }
-
-  if (params.to) {
-    const toDate = new Date(params.to);
-    if (!Number.isNaN(toDate.getTime())) {
-      range.toDate = toDate.toISOString().slice(0, 10);
-    }
-  }
-
-  return range;
-}
+// normaliseDateRange moved to utils/dates.ts

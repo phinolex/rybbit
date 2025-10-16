@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db/postgres/postgres.js";
 import { projectEvents, projectFunnelSteps, projectFunnels } from "../../db/postgres/schema.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
+import { buildDateRangeFilters } from "../../api/v1/utils/index.js";
 
 const logger = createServiceLogger("project-funnels");
 
@@ -58,26 +59,11 @@ export async function listFunnels(projectId: string): Promise<FunnelRecord[]> {
     if (!acc[step.funnelId]) {
       acc[step.funnelId] = [];
     }
-    acc[step.funnelId].push({
-      id: step.id,
-      key: step.stepKey,
-      name: step.name,
-      order: step.stepOrder,
-      pagePattern: step.pagePattern ?? null,
-    });
+    acc[step.funnelId].push(mapStepRecord(step));
     return acc;
   }, {});
 
-  return funnels.map(funnel => ({
-    id: funnel.id,
-    projectId: funnel.projectId,
-    name: funnel.name,
-    description: funnel.description ?? null,
-    isActive: funnel.isActive,
-    createdAt: funnel.createdAt,
-    updatedAt: funnel.updatedAt,
-    steps: stepsByFunnel[funnel.id] ?? [],
-  }));
+  return funnels.map(funnel => mapFunnelRecord(funnel, stepsByFunnel[funnel.id] ?? []));
 }
 
 export async function getFunnel(projectId: string, funnelId: string): Promise<FunnelRecord | null> {
@@ -97,22 +83,7 @@ export async function getFunnel(projectId: string, funnelId: string): Promise<Fu
     .where(eq(projectFunnelSteps.funnelId, funnelId))
     .orderBy(asc(projectFunnelSteps.stepOrder));
 
-  return {
-    id: funnel[0].id,
-    projectId: funnel[0].projectId,
-    name: funnel[0].name,
-    description: funnel[0].description ?? null,
-    isActive: funnel[0].isActive,
-    createdAt: funnel[0].createdAt,
-    updatedAt: funnel[0].updatedAt,
-    steps: steps.map(step => ({
-      id: step.id,
-      key: step.stepKey,
-      name: step.name,
-      order: step.stepOrder,
-      pagePattern: step.pagePattern ?? null,
-    })),
-  };
+  return mapFunnelRecord(funnel[0], steps.map(mapStepRecord));
 }
 
 type NormalisedFunnelStep = FunnelStepInput & { order: number };
@@ -150,22 +121,7 @@ export async function createFunnel(projectId: string, input: FunnelInput): Promi
       )
       .returning();
 
-    return {
-      id: funnel.id,
-      projectId: funnel.projectId,
-      name: funnel.name,
-      description: funnel.description ?? null,
-      isActive: funnel.isActive,
-      createdAt: funnel.createdAt,
-      updatedAt: funnel.updatedAt,
-      steps: insertedSteps.map(step => ({
-        id: step.id,
-        key: step.stepKey,
-        name: step.name,
-        order: step.stepOrder,
-        pagePattern: step.pagePattern ?? null,
-      })),
-    };
+    return mapFunnelRecord(funnel, insertedSteps.map(mapStepRecord));
   });
 }
 
@@ -219,22 +175,15 @@ export async function updateFunnel(projectId: string, funnelId: string, input: P
         .returning();
     }
 
-    return {
-      id: existing.id,
-      projectId: existing.projectId,
+    const updatedFunnel = {
+      ...existing,
       name: input.name ?? existing.name,
-      description: input.description ?? existing.description ?? null,
+      description: input.description ?? existing.description,
       isActive: input.isActive ?? existing.isActive,
-      createdAt: existing.createdAt,
       updatedAt,
-      steps: steps.map(step => ({
-        id: step.id,
-        key: step.stepKey,
-        name: step.name,
-        order: step.stepOrder,
-        pagePattern: step.pagePattern ?? null,
-      })),
     };
+
+    return mapFunnelRecord(updatedFunnel, steps.map(mapStepRecord));
   });
 }
 
@@ -243,7 +192,7 @@ export async function deleteFunnel(projectId: string, funnelId: string): Promise
     .delete(projectFunnels)
     .where(and(eq(projectFunnels.id, funnelId), eq(projectFunnels.projectId, projectId)))
     .returning({ id: projectFunnels.id });
-  return deleted.length > 0;
+  return !!deleted.length;
 }
 
 export interface FunnelStatsRequest {
@@ -286,15 +235,11 @@ export async function getFunnelStats(
     };
   }
 
-  const filters = [eq(projectEvents.projectId, projectId), eq(projectEvents.funnelId, funnelId)];
-
-  if (params.from) {
-    filters.push(sql`${projectEvents.occurredAt} >= ${params.from}`);
-  }
-
-  if (params.to) {
-    filters.push(sql`${projectEvents.occurredAt} <= ${params.to}`);
-  }
+  const filters = [
+    eq(projectEvents.projectId, projectId),
+    eq(projectEvents.funnelId, funnelId),
+    ...buildDateRangeFilters(projectEvents.occurredAt, params.from, params.to),
+  ];
 
   const stats = await db
     .select({
@@ -367,4 +312,32 @@ export function normaliseSteps(steps: FunnelStepInput[]): NormalisedFunnelStep[]
   }
 
   return ordered;
+}
+
+// Helper functions to eliminate duplication
+
+function mapStepRecord(step: typeof projectFunnelSteps.$inferSelect): FunnelRecord["steps"][number] {
+  return {
+    id: step.id,
+    key: step.stepKey,
+    name: step.name,
+    order: step.stepOrder,
+    pagePattern: step.pagePattern ?? null,
+  };
+}
+
+function mapFunnelRecord(
+  funnel: typeof projectFunnels.$inferSelect,
+  steps: FunnelRecord["steps"]
+): FunnelRecord {
+  return {
+    id: funnel.id,
+    projectId: funnel.projectId,
+    name: funnel.name,
+    description: funnel.description ?? null,
+    isActive: funnel.isActive,
+    createdAt: funnel.createdAt,
+    updatedAt: funnel.updatedAt,
+    steps,
+  };
 }

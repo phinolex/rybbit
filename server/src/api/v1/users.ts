@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { countUsers, listUsers } from "../../services/projects/userService.js";
+import { validateProjectAndRequest } from "./utils/index.js";
 
 const usersQuerySchema = z.object({
   limit: z.coerce.number().min(1).max(200).default(50),
@@ -11,21 +12,16 @@ const usersQuerySchema = z.object({
 
 export async function registerUserRoutes(server: FastifyInstance) {
   server.get("/", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, usersQuerySchema);
+    if (!validated) return;
 
-    const parsed = usersQuerySchema.safeParse(request.query);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid query parameters", details: parsed.error.issues });
-    }
-
-    const { limit, page, from, to } = parsed.data;
-    const offset = (page - 1) * limit;
+    const { project, data } = validated;
+    const { limit, page, from, to } = data;
+    const offset = ((page ?? 1) - 1) * (limit ?? 50);
 
     const [rows, total] = await Promise.all([
-      listUsers(request.project.id, { limit, offset, from, to }),
-      countUsers(request.project.id, { from, to }),
+      listUsers(project.id, { limit: limit ?? 50, offset, from, to }),
+      countUsers(project.id, { from, to }),
     ]);
 
     return reply.send({

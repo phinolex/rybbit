@@ -38,20 +38,17 @@ export function hashSecret(value: string): string {
 }
 
 export function hashIdentifier(value: string | null | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-  return hashSecret(value);
+  return value ? hashSecret(value) : null;
 }
 
 export async function getProjectById(projectId: string): Promise<ProjectRecord | null> {
-  const records = await db
+  const [record] = await db
     .select()
     .from(projects)
     .where(eq(projects.id, projectId))
     .limit(1);
 
-  return records[0] ? mapProjectRecord(records[0]) : null;
+  return record ? mapProjectRecord(record) : null;
 }
 
 export async function getProjectByApiKey(apiKey: string): Promise<ProjectRecord | null> {
@@ -119,7 +116,7 @@ export async function deactivateProject(projectId: string): Promise<void> {
  */
 export async function getOrCreateProjectForSite(siteId: number, organizationId: string): Promise<ProjectRecord> {
   // Look for existing project linked to this site
-  const existing = await db
+  const [existing] = await db
     .select()
     .from(projects)
     .where(
@@ -130,8 +127,8 @@ export async function getOrCreateProjectForSite(siteId: number, organizationId: 
     )
     .limit(1);
 
-  if (existing.length > 0) {
-    return mapProjectRecord(existing[0]);
+  if (existing) {
+    return mapProjectRecord(existing);
   }
 
   // Create a new project for this site

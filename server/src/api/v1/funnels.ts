@@ -10,6 +10,13 @@ import {
   listFunnels,
   updateFunnel,
 } from "../../services/projects/funnelService.js";
+import {
+  validateProjectAndRequest,
+  validateProjectContext,
+  mapFunnelToResponse,
+  normalizeStepInput,
+  buildPartialUpdate,
+} from "./utils/index.js";
 
 const stepSchema = z.object({
   key: z.string().min(1).max(64),
@@ -38,54 +45,25 @@ type IdParams = {
   id: string;
 };
 
-function mapFunnel(funnel: FunnelRecord) {
-  return {
-    id: funnel.id,
-    name: funnel.name,
-    description: funnel.description,
-    is_active: funnel.isActive,
-    created_at: funnel.createdAt,
-    updated_at: funnel.updatedAt,
-    steps: funnel.steps.map(step => ({
-      id: step.id,
-      key: step.key,
-      name: step.name,
-      order: step.order,
-      page_pattern: step.pagePattern,
-    })),
-  };
-}
-
-function mapFunnelResponse(funnel: FunnelRecord | null) {
-  return funnel ? mapFunnel(funnel) : null;
-}
+// Mapping functions moved to utils/mappers.ts for reuse
 
 export async function registerFunnelRoutes(server: FastifyInstance) {
   server.post("/", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, funnelSchema, "body");
+    if (!validated) return;
 
-    const parsed = funnelSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid payload", details: parsed.error.issues });
-    }
+    const { project, data } = validated;
 
     const input: FunnelInput = {
-      name: parsed.data.name,
-      description: parsed.data.description,
-      isActive: parsed.data.is_active,
-      steps: parsed.data.steps.map(step => ({
-        key: step.key,
-        name: step.name,
-        order: step.order,
-        pagePattern: step.page_pattern,
-      })),
+      name: data.name,
+      description: data.description,
+      isActive: data.is_active,
+      steps: normalizeStepInput(data.steps),
     };
 
     try {
-      const funnel = await createFunnel(request.project.id, input);
-      return reply.status(201).send({ data: mapFunnelResponse(funnel) });
+      const funnel = await createFunnel(project.id, input);
+      return reply.status(201).send({ data: mapFunnelToResponse(funnel) });
     } catch (error) {
       request.log.error(error, "Failed to create funnel");
       return reply.status(500).send({ error: "Failed to create funnel" });
@@ -93,63 +71,50 @@ export async function registerFunnelRoutes(server: FastifyInstance) {
   });
 
   server.get("/", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
-    const funnels = await listFunnels(request.project.id);
+    if (!validateProjectContext(request, reply)) return;
+
+    const funnels = await listFunnels((request as any).project.id);
     return reply.send({
-      data: funnels.map(mapFunnel),
+      data: funnels.map(mapFunnelToResponse),
     });
   });
 
   server.get<{ Params: IdParams }>("/:id", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    if (!validateProjectContext(request, reply)) return;
 
-    const funnel = await getFunnel(request.project.id, request.params.id);
+    const funnel = await getFunnel((request as any).project.id, request.params.id);
     if (!funnel) {
       return reply.status(404).send({ error: "Funnel not found" });
     }
-    return reply.send({ data: mapFunnelResponse(funnel) });
+    return reply.send({ data: mapFunnelToResponse(funnel) });
   });
 
   server.patch<{ Params: IdParams }>("/:id", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, updateSchema, "body");
+    if (!validated) return;
 
-    const parsed = updateSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid payload", details: parsed.error.issues });
-    }
+    const { project, data } = validated;
 
-    const input: Partial<FunnelInput> = {};
-    if (parsed.data.name !== undefined) input.name = parsed.data.name;
-    if (parsed.data.description !== undefined) input.description = parsed.data.description;
-    if (parsed.data.is_active !== undefined) input.isActive = parsed.data.is_active;
-    if (parsed.data.steps) {
-      input.steps = parsed.data.steps.map(step => ({
-        key: step.key,
-        name: step.name,
-        order: step.order,
-        pagePattern: step.page_pattern,
-      }));
-    }
+    const input: Partial<FunnelInput> = {
+      ...buildPartialUpdate(data, {
+        name: "name",
+        description: "description",
+        is_active: "isActive",
+      }),
+      ...(data.steps && { steps: normalizeStepInput(data.steps) }),
+    };
 
-    const funnel = await updateFunnel(request.project.id, request.params.id, input);
+    const funnel = await updateFunnel(project.id, request.params.id, input);
     if (!funnel) {
       return reply.status(404).send({ error: "Funnel not found" });
     }
-    return reply.send({ data: mapFunnelResponse(funnel) });
+    return reply.send({ data: mapFunnelToResponse(funnel) });
   });
 
   server.delete<{ Params: IdParams }>("/:id", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    if (!validateProjectContext(request, reply)) return;
 
-    const success = await deleteFunnel(request.project.id, request.params.id);
+    const success = await deleteFunnel((request as any).project.id, request.params.id);
     if (!success) {
       return reply.status(404).send({ error: "Funnel not found" });
     }
@@ -157,16 +122,12 @@ export async function registerFunnelRoutes(server: FastifyInstance) {
   });
 
   server.get<{ Params: IdParams }>("/:id/stats", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, statsQuerySchema);
+    if (!validated) return;
 
-    const parsedQuery = statsQuerySchema.safeParse(request.query);
-    if (!parsedQuery.success) {
-      return reply.status(400).send({ error: "Invalid query parameters", details: parsedQuery.error.issues });
-    }
+    const { project, data } = validated;
 
-    const stats = await getFunnelStats(request.project.id, request.params.id, parsedQuery.data);
+    const stats = await getFunnelStats(project.id, request.params.id, data);
     if (!stats) {
       return reply.status(404).send({ error: "Funnel not found" });
     }

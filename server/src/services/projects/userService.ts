@@ -1,6 +1,7 @@
-import { SQL, and, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { SQL, desc, eq, sql } from "drizzle-orm";
 import { db } from "../../db/postgres/postgres.js";
 import { projectEvents } from "../../db/postgres/schema.js";
+import { combineConditions, buildDateRangeFilters } from "../../api/v1/utils/index.js";
 
 export interface ListUsersParams {
   limit: number;
@@ -67,20 +68,12 @@ interface EventRangeParams {
 }
 
 function buildFilters(projectId: string, from?: string, to?: string): SQL<unknown> {
-  const conditions: SQL<unknown>[] = [eq(projectEvents.projectId, projectId)];
+  const conditions: SQL<unknown>[] = [
+    eq(projectEvents.projectId, projectId),
+    ...buildDateRangeFilters(projectEvents.occurredAt, from, to),
+  ];
 
-  if (from) {
-    conditions.push(gte(projectEvents.occurredAt, from));
-  }
-
-  if (to) {
-    conditions.push(lte(projectEvents.occurredAt, to));
-  }
-
-  let combined: SQL<unknown> | undefined;
-  for (const clause of conditions) {
-    combined = combined ? and(combined, clause) : clause;
-  }
+  const combined = combineConditions(conditions);
 
   if (!combined) {
     throw new Error("Failed to build filters for visitor query");

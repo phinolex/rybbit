@@ -70,3 +70,7 @@ preset*:
 ℹ️
 ✅
 ��
+
+# Temporary refactoring documentation
+REFACTORING_*.md
+OPTIMIZATION_*.md

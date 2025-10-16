@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { ingestEvents, listEvents } from "../../services/projects/eventService.js";
 import { getEventDailySeries, getEventSummary } from "../../services/projects/eventStatsService.js";
+import { validateProjectAndRequest, validateProjectContext, validateRequest } from "./utils/index.js";
 
 export const eventSchema = z
   .object({
@@ -46,23 +47,15 @@ const statsQuerySchema = z.object({
 
 export async function registerEventRoutes(server: FastifyInstance) {
   server.post("/", { config: { rateLimit: false } }, async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    if (!validateProjectContext(request, reply)) return;
 
-    const parseResult = payloadSchema.safeParse(request.body);
+    const parseResult = validateRequest(request.body, payloadSchema, reply);
+    if (!parseResult) return;
 
-    if (!parseResult.success) {
-      return reply.status(400).send({
-        error: "Invalid payload",
-        details: parseResult.error.issues,
-      });
-    }
-
-    const events = Array.isArray(parseResult.data) ? parseResult.data : [parseResult.data];
+    const events = Array.isArray(parseResult) ? parseResult : [parseResult];
 
     try {
-      const result = await ingestEvents(request.project, events);
+      const result = await ingestEvents((request as any).project, events);
       request.log.info(
         { accepted: result.accepted, skipped: result.skipped, total: result.total },
         "Events ingested"
@@ -79,23 +72,15 @@ export async function registerEventRoutes(server: FastifyInstance) {
   });
 
   server.get("/", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, querySchema);
+    if (!validated) return;
 
-    const parsed = querySchema.safeParse(request.query);
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid query parameters",
-        details: parsed.error.issues,
-      });
-    }
+    const { project, data } = validated;
+    const { limit, page, from, to } = data;
 
-    const { limit, page, from, to } = parsed.data;
+    const offset = ((page ?? 1) - 1) * (limit ?? 50);
 
-    const offset = (page - 1) * limit;
-
-    const rows = await listEvents(request.project.id, { limit, offset, from, to });
+    const rows = await listEvents(project.id, { limit: limit ?? 50, offset, from, to });
 
     return reply.send({
       data: rows.map(row => ({
@@ -116,30 +101,22 @@ export async function registerEventRoutes(server: FastifyInstance) {
   });
 
   server.get("/stats/summary", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, statsQuerySchema);
+    if (!validated) return;
 
-    const parsed = statsQuerySchema.safeParse(request.query);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid query parameters", details: parsed.error.issues });
-    }
+    const { project, data } = validated;
 
-    const summary = await getEventSummary(request.project.id, parsed.data);
+    const summary = await getEventSummary(project.id, data);
     return reply.send({ data: summary });
   });
 
   server.get("/stats/daily", async (request, reply) => {
-    if (!request.project) {
-      return reply.status(500).send({ error: "Project context missing" });
-    }
+    const validated = validateProjectAndRequest(request, reply, statsQuerySchema);
+    if (!validated) return;
 
-    const parsed = statsQuerySchema.safeParse(request.query);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid query parameters", details: parsed.error.issues });
-    }
+    const { project, data } = validated;
 
-    const series = await getEventDailySeries(request.project.id, parsed.data);
+    const series = await getEventDailySeries(project.id, data);
     return reply.send({ data: series });
   });
 }

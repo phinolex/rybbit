@@ -8,6 +8,11 @@ import {
   projectVisitorsDaily,
 } from "../../db/postgres/schema.js";
 import { getCachedValue, setCachedValue } from "./statsCache.js";
+import {
+  combineConditions,
+  buildDateRangeFilters,
+  normalizeDateToYYYYMMDD,
+} from "../../api/v1/utils/index.js";
 
 type Granularity = "daily" | "monthly" | "yearly";
 
@@ -24,8 +29,8 @@ export interface OverviewPoint {
 }
 
 export async function getOverviewStats(projectId: string, params: OverviewParams): Promise<OverviewPoint[]> {
-  const fromDate = normalizeDateInput(params.from);
-  const toDate = normalizeDateInput(params.to);
+  const fromDate = normalizeDateToYYYYMMDD(params.from);
+  const toDate = normalizeDateToYYYYMMDD(params.to);
 
   const cacheKey = JSON.stringify({ granularity: params.granularity, from: fromDate, to: toDate });
   const cached = getCachedValue<OverviewPoint[]>("overview", projectId, cacheKey);
@@ -33,13 +38,10 @@ export async function getOverviewStats(projectId: string, params: OverviewParams
     return cached;
   }
 
-  const overviewConditions: SQL<unknown>[] = [eq(projectOverviewDaily.projectId, projectId)];
-  if (fromDate) {
-    overviewConditions.push(gte(projectOverviewDaily.eventDate, fromDate));
-  }
-  if (toDate) {
-    overviewConditions.push(lte(projectOverviewDaily.eventDate, toDate));
-  }
+  const overviewConditions: SQL<unknown>[] = [
+    eq(projectOverviewDaily.projectId, projectId),
+    ...buildDateRangeFilters(projectOverviewDaily.eventDate, fromDate, toDate),
+  ];
 
   const overviewCondition = combineConditions(overviewConditions)!;
 
@@ -69,13 +71,10 @@ export async function getOverviewStats(projectId: string, params: OverviewParams
   }
 
   if (params.granularity !== "daily") {
-    const visitorConditions: SQL<unknown>[] = [eq(projectVisitorsDaily.projectId, projectId)];
-    if (fromDate) {
-      visitorConditions.push(gte(projectVisitorsDaily.eventDate, fromDate));
-    }
-    if (toDate) {
-      visitorConditions.push(lte(projectVisitorsDaily.eventDate, toDate));
-    }
+    const visitorConditions: SQL<unknown>[] = [
+      eq(projectVisitorsDaily.projectId, projectId),
+      ...buildDateRangeFilters(projectVisitorsDaily.eventDate, fromDate, toDate),
+    ];
 
     const periodExpr =
       params.granularity === "monthly"
@@ -129,8 +128,8 @@ export interface PageStats {
 }
 
 export async function getPageStats(projectId: string, params: PageStatsParams): Promise<PageStats[]> {
-  const fromDate = normalizeDateInput(params.from);
-  const toDate = normalizeDateInput(params.to);
+  const fromDate = normalizeDateToYYYYMMDD(params.from);
+  const toDate = normalizeDateToYYYYMMDD(params.to);
 
   const cacheKey = JSON.stringify({
     path: params.path ?? null,
@@ -144,18 +143,15 @@ export async function getPageStats(projectId: string, params: PageStatsParams): 
     return cached;
   }
 
-  const pageConditions: SQL<unknown>[] = [eq(pageAggDaily.projectId, projectId)];
+  const pageConditions: SQL<unknown>[] = [
+    eq(pageAggDaily.projectId, projectId),
+    ...buildDateRangeFilters(pageAggDaily.eventDate, fromDate, toDate),
+  ];
   if (params.path) {
     pageConditions.push(eq(pageAggDaily.pagePath, params.path));
   }
   if (params.pageUrl) {
     pageConditions.push(eq(pageAggDaily.pageUrl, params.pageUrl));
-  }
-  if (fromDate) {
-    pageConditions.push(gte(pageAggDaily.eventDate, fromDate));
-  }
-  if (toDate) {
-    pageConditions.push(lte(pageAggDaily.eventDate, toDate));
   }
 
   const pageCondition = combineConditions(pageConditions)!;
@@ -179,18 +175,15 @@ export async function getPageStats(projectId: string, params: PageStatsParams): 
     return [];
   }
 
-  const visitorConditions: SQL<unknown>[] = [eq(projectPageVisitorsDaily.projectId, projectId)];
+  const visitorConditions: SQL<unknown>[] = [
+    eq(projectPageVisitorsDaily.projectId, projectId),
+    ...buildDateRangeFilters(projectPageVisitorsDaily.eventDate, fromDate, toDate),
+  ];
   if (params.path) {
     visitorConditions.push(eq(projectPageVisitorsDaily.pagePath, params.path));
   }
   if (params.pageUrl) {
     visitorConditions.push(eq(projectPageVisitorsDaily.pageUrl, params.pageUrl));
-  }
-  if (fromDate) {
-    visitorConditions.push(gte(projectPageVisitorsDaily.eventDate, fromDate));
-  }
-  if (toDate) {
-    visitorConditions.push(lte(projectPageVisitorsDaily.eventDate, toDate));
   }
   if (!params.path && !params.pageUrl) {
     const scopedFilters = pageRows
@@ -297,16 +290,7 @@ export async function getRealtimeStats(projectId: string, lookbackSeconds = 300)
   };
 }
 
-function normalizeDateInput(input?: string): string | undefined {
-  if (!input) {
-    return undefined;
-  }
-  const date = new Date(input);
-  if (Number.isNaN(date.getTime())) {
-    throw new Error(`Invalid date value: ${input}`);
-  }
-  return date.toISOString().slice(0, 10);
-}
+// Moved to utils/dates.ts
 
 function toPeriodStartKey(dateValue: string, granularity: Granularity): string {
   const date = new Date(`${dateValue}T00:00:00.000Z`);
@@ -344,17 +328,7 @@ function normalizePeriodValue(value: unknown): string {
   throw new Error("Unexpected period value from aggregation query");
 }
 
-function combineConditions(conditions: SQL<unknown>[]): SQL<unknown> | undefined {
-  if (!conditions.length) {
-    return undefined;
-  }
-
-  let combined: SQL<unknown> | undefined;
-  for (const condition of conditions) {
-    combined = combined ? and(combined, condition) : condition;
-  }
-  return combined;
-}
+// Moved to utils/filters.ts
 
 function buildPageKey(path: string | null, pageUrl: string | null): string {
   return `${path ?? "__null__"}|${pageUrl ?? "__null__"}`;

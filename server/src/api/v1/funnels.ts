@@ -24,7 +24,11 @@ const stepSchema = z.object({
   order: z.number().int().nonnegative().optional(),
   page_pattern: z.string().max(2048).optional(),
   pagePattern: z.string().max(2048).optional(), // Support both camelCase and snake_case
-});
+}).transform((data) => ({
+  ...data,
+  // Normalize: if pagePattern is provided, use it as page_pattern
+  page_pattern: data.page_pattern ?? data.pagePattern,
+}));
 
 const funnelSchema = z.object({
   name: z.string().min(1).max(128),

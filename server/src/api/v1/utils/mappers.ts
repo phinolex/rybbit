@@ -21,13 +21,14 @@ export function mapFunnelSteps(steps: any[]): any[] {
  * Normalizes funnel step input from API format to service format
  * Used in POST and PATCH endpoints
  * Supports both camelCase and snake_case input for flexibility
+ * Note: Prioritizes page_pattern (snake_case) as it's the validated Zod field
  */
 export function normalizeStepInput(steps: any[]): any[] {
   return steps.map(step => ({
     key: step.key,
     name: step.name,
     order: step.order ?? undefined,
-    pagePattern: step.pagePattern ?? step.page_pattern ?? undefined,
+    pagePattern: step.page_pattern ?? step.pagePattern ?? undefined,
   }));
 }
 

@@ -66,11 +66,57 @@ export async function getEventDailySeries(projectId: string, params: EventStatsP
     .where(and(...filters))
     .orderBy(projectOverviewDaily.eventDate);
 
-  return rows.map(row => ({
-    date: new Date(`${row.eventDate}T00:00:00.000Z`).toISOString(),
-    events: Number(row.events ?? 0),
-    uniqueVisitors: Number(row.uniqueVisitors ?? 0),
-  }));
+  // Create a map of existing data for quick lookup
+  const dataMap = new Map<string, EventDailyPoint>();
+  rows.forEach(row => {
+    dataMap.set(row.eventDate, {
+      date: new Date(`${row.eventDate}T00:00:00.000Z`).toISOString(),
+      events: Number(row.events ?? 0),
+      uniqueVisitors: Number(row.uniqueVisitors ?? 0),
+    });
+  });
+
+  // Generate all dates in the range and fill gaps with zeros
+  const allDates = generateDateRange(fromDate, toDate);
+
+  return allDates.map(dateStr => {
+    const existing = dataMap.get(dateStr);
+    if (existing) {
+      return existing;
+    }
+    // Fill gap with zeros
+    return {
+      date: new Date(`${dateStr}T00:00:00.000Z`).toISOString(),
+      events: 0,
+      uniqueVisitors: 0,
+    };
+  });
+}
+
+/**
+ * Generate an array of date strings (YYYY-MM-DD) between two dates (inclusive)
+ * Used for gap filling in analytics data
+ */
+function generateDateRange(fromDate?: string, toDate?: string): string[] {
+  // Default to last 30 days if no dates provided
+  const end = toDate ? new Date(toDate) : new Date();
+  const start = fromDate ? new Date(fromDate) : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  const dates: string[] = [];
+  const current = new Date(start);
+
+  // Generate all dates from start to end (inclusive)
+  while (current <= end) {
+    const year = current.getFullYear();
+    const month = String(current.getMonth() + 1).padStart(2, '0');
+    const day = String(current.getDate()).padStart(2, '0');
+    dates.push(`${year}-${month}-${day}`);
+
+    // Move to next day
+    current.setDate(current.getDate() + 1);
+  }
+
+  return dates;
 }
 
 function buildEventFilters(projectId: string, params: EventStatsParams): SQL<unknown>[] {

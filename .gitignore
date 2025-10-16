@@ -74,3 +74,5 @@ preset*:
 # Temporary refactoring documentation
 REFACTORING_*.md
 OPTIMIZATION_*.md
+BETA_TEST_*.md
+SECURITY_AUDIT_*.md

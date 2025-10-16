@@ -127,12 +127,22 @@ const server = Fastify({
           : undefined, // Production without Axiom - plain JSON to stdout
     serializers: {
       req(request) {
+        const headers = { ...request.headers };
+
+        // Mask sensitive data in headers
+        if (headers['x-api-key'] && typeof headers['x-api-key'] === 'string') {
+          headers['x-api-key'] = headers['x-api-key'].substring(0, 8) + '***';
+        }
+        if (headers['authorization']) {
+          headers['authorization'] = '***';
+        }
+
         return {
           method: request.method,
           url: request.url,
           path: request.url,
           parameters: request.params,
-          headers: request.headers,
+          headers,
         };
       },
       res(reply) {

@@ -1,5 +1,31 @@
 # 🚀 REST API v1 Implementation - Complete Analytics Infrastructure
 
+## 📋 Summary
+
+This PR introduces a **complete REST API v1** for Rybbit, implementing a modern, RESTful interface for programmatic analytics access alongside the existing Site-based tracking system. The implementation uses a **unified authentication system** where a single `rb_*` API key provides access to both browser tracking and REST API endpoints.
+
+**Key Feature: Unified Authentication**
+- **Single API Key (`rb_*`)**: Users now use the same API key for both browser tracking and REST API v1
+- **Automatic Project Linking**: API v1 requests automatically create and link a Project to the Site on first use
+- **Simplified User Experience**: No need to manage separate keys for different use cases
+
+The implementation includes **5 core modules**, **20+ endpoints**, complete database schema, services layer, authentication middleware, rate limiting, and comprehensive testing validation.
+
+---
+
+## 🎯 Motivation
+
+Rybbit currently excels at browser-based analytics but lacks programmatic API access for:
+- Server-side event tracking
+- Backend application analytics
+- Custom funnel management via API
+- Programmatic stats retrieval
+- Multi-platform integration (mobile apps, IoT, etc.)
+
+This REST API v1 implementation fills that gap while maintaining **100% backward compatibility** with existing Site tracking.
+
+---
+
 ## 📡 Features Endpoints
 
 **Events API (4 endpoints):**
@@ -26,32 +52,6 @@
 
 **Realtime API (1 endpoint):**
 - `GET /api/v1/realtime/visitors` - Server-Sent Events stream of real-time visitor data
-
----
-
-## 📋 Summary
-
-This PR introduces a **complete REST API v1** for Rybbit, implementing a modern, RESTful interface for programmatic analytics access alongside the existing Site-based tracking system. The implementation uses a **unified authentication system** where a single `rb_*` API key provides access to both browser tracking and REST API endpoints.
-
-**Key Feature: Unified Authentication**
-- **Single API Key (`rb_*`)**: Users now use the same API key for both browser tracking and REST API v1
-- **Automatic Project Linking**: API v1 requests automatically create and link a Project to the Site on first use
-- **Simplified User Experience**: No need to manage separate keys for different use cases
-
-The implementation includes **5 core modules**, **20+ endpoints**, complete database schema, services layer, authentication middleware, rate limiting, and comprehensive testing validation.
-
----
-
-## 🎯 Motivation
-
-Rybbit currently excels at browser-based analytics but lacks programmatic API access for:
-- Server-side event tracking
-- Backend application analytics
-- Custom funnel management via API
-- Programmatic stats retrieval
-- Multi-platform integration (mobile apps, IoT, etc.)
-
-This REST API v1 implementation fills that gap while maintaining **100% backward compatibility** with existing Site tracking.
 
 ---
 
